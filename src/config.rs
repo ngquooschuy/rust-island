@@ -22,6 +22,7 @@ pub struct Config {
     pub colors: Colors,
     pub font: FontConfig,
     pub clock: ClockConfig,
+    pub weather: WeatherConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -36,7 +37,7 @@ impl Default for WindowConfig {
     fn default() -> Self {
         Self {
             top: 10,
-            collapsed_width: 160.0,
+            collapsed_width: 220.0,
             expanded_width: 400.0,
         }
     }
@@ -48,14 +49,17 @@ pub struct Colors {
     pub background: Color,
     pub text: Color,
     pub secondary: Color,
+    /// Màu nhấn: thanh pin, chấm phân trang đang chọn
+    pub accent: Color,
 }
 
 impl Default for Colors {
     fn default() -> Self {
         Self {
-            background: Color::rgb(0x00, 0x00, 0x00),
-            text: Color::rgb(0xFF, 0xFF, 0xFF),
-            secondary: Color::rgb(0xB3, 0xB3, 0xB8),
+            background: Color::rgb(0x0F, 0x11, 0x12),
+            text: Color::rgb(0xF5, 0xF5, 0xF7),
+            secondary: Color::rgb(0x8E, 0x8E, 0x93),
+            accent: Color::rgb(0x4C, 0xC2, 0xEA),
         }
     }
 }
@@ -86,6 +90,25 @@ impl Default for ClockConfig {
         Self {
             hour24: true,
             show_seconds: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WeatherConfig {
+    /// false: không gọi mạng, ô bên phải hiện pin (hoặc thứ/ngày)
+    pub enabled: bool,
+    pub city: String,
+    pub fahrenheit: bool,
+}
+
+impl Default for WeatherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            city: "Hà Nội".into(),
+            fahrenheit: false,
         }
     }
 }
@@ -156,9 +179,10 @@ impl Config {
         let d = WindowConfig::default();
         let w = &mut self.window;
         w.top = w.top.clamp(0, 300);
-        // Thu gọn luôn hẹp hơn mở rộng, để hiệu ứng chuyển chữ không chia cho 0
-        w.collapsed_width = clamp_or(w.collapsed_width, 100.0, 280.0, d.collapsed_width);
-        w.expanded_width = clamp_or(w.expanded_width, 300.0, 700.0, d.expanded_width);
+        // Thu gọn luôn hẹp hơn mở rộng, để hiệu ứng chuyển chữ không chia cho 0.
+        // Dưới 180 thì đồng hồ và pin ở Idle View không đủ chỗ
+        w.collapsed_width = clamp_or(w.collapsed_width, 180.0, 300.0, d.collapsed_width);
+        w.expanded_width = clamp_or(w.expanded_width, 320.0, 700.0, d.expanded_width);
         self
     }
 }
@@ -267,7 +291,7 @@ mod tests {
         let c = Config::parse("[window]\ntop = -50\ncollapsed_width = 999\nexpanded_width = nan")
             .unwrap();
         assert_eq!(c.window.top, 0);
-        assert_eq!(c.window.collapsed_width, 280.0);
+        assert_eq!(c.window.collapsed_width, 300.0);
         assert_eq!(c.window.expanded_width, 400.0);
     }
 

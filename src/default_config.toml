@@ -5,15 +5,16 @@
 [window]
 # Khoảng cách từ mép trên màn hình, đơn vị pixel (0–300)
 top = 10
-# Chiều rộng khi thu gọn (100–280) và khi mở rộng (300–700)
-collapsed_width = 160
+# Chiều rộng khi thu gọn (180–300) và khi mở rộng (320–700)
+collapsed_width = 220
 expanded_width = 400
 
 [colors]
 # Dạng "#RRGGBB"
-background = "#000000"
-text = "#FFFFFF"
-secondary = "#B3B3B8" # tên nghệ sĩ, ngày tháng
+background = "#0F1112"
+text = "#F5F5F7"
+secondary = "#8E8E93" # tên nghệ sĩ, ngày tháng, vạch ngăn
+accent = "#4CC2EA"    # thanh pin, chấm phân trang đang chọn
 
 [font]
 # Tên font đã cài trên máy, ví dụ "Segoe UI", "Arial", "Consolas"
@@ -22,3 +23,9 @@ family = "Segoe UI"
 [clock]
 hour24 = true       # false: kiểu 12 giờ (SA/CH)
 show_seconds = true # hiện giây khi mở rộng
+
+[weather]
+# Lấy thời tiết từ open-meteo.com (miễn phí, 15 phút cập nhật một lần)
+enabled = true      # false: không dùng mạng, bên phải hiện pin thay cho thời tiết
+city = "Hà Nội"     # tên thành phố, tiếng Việt hay tiếng Anh đều được
+fahrenheit = false  # true: hiện °F

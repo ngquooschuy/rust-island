@@ -4,12 +4,14 @@
 mod animation; // lò xo cho hiệu ứng co giãn
 mod app; // trạng thái island, xử lý sự kiện
 mod autostart; // khởi động cùng Windows
+mod battery; // trạng thái pin
 mod config; // đọc file cấu hình config.toml
-mod content; // chuỗi hiển thị: giờ, ngày, bài hát
+mod content; // nội dung hiển thị và các trang (Idle, Media)
 mod graphics; // vẽ bằng Direct2D + DirectComposition
 mod layout; // kích thước, vị trí nút
 mod media; // luồng nền đọc/điều khiển media
 mod tray; // icon khay hệ thống
+mod weather; // luồng nền tải thời tiết từ Open-Meteo
 
 use std::cell::RefCell;
 use std::sync::mpsc;
@@ -35,6 +37,7 @@ use graphics::Graphics;
 use layout::Layout;
 use media::{MediaCommand, WM_MEDIA_CHANGED};
 use tray::WM_TRAY;
+use weather::WM_WEATHER_CHANGED;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -187,6 +190,10 @@ fn main() -> Result<()> {
     // HWND chứa con trỏ nên không gửi qua luồng được: đổi sang số trước
     let hwnd_raw = hwnd.0 as isize;
     std::thread::spawn(move || media::run(hwnd_raw, rx));
+    if config.weather.enabled {
+        let weather_config = config.weather.clone();
+        std::thread::spawn(move || weather::run(hwnd_raw, weather_config));
+    }
 
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -206,11 +213,17 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let (x, y) = mouse_pos(lparam);
             with_app(|app| app.on_click(x, y));
         }
+        // Con lăn: nửa cao của wparam là độ lăn (có dấu, ±120 mỗi nấc)
+        WM_MOUSEWHEEL => {
+            let delta = (wparam.0 >> 16) as u16 as i16;
+            with_app(|app| app.on_wheel(delta));
+        }
         WM_TIMER => {
             let fullscreen = is_fullscreen_app_running();
             with_app(|app| app.on_timer(hwnd, fullscreen));
         }
         WM_MEDIA_CHANGED => with_app(|app| app.on_media_changed()),
+        WM_WEATHER_CHANGED => with_app(|app| app.on_weather_changed()),
         // Màn hình đổi (cắm/rút, đổi độ phân giải): đặt lại vị trí
         WM_DISPLAYCHANGE => with_app(|app| position_window(hwnd, app.layout())),
         // Icon khay: chuột phải thì hiện menu

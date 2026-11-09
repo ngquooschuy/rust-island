@@ -17,10 +17,13 @@ use windows::{
 
 use crate::animation::Spring;
 use crate::config::ClockConfig;
-use crate::content::{self, Content};
+use crate::content::{self, Content, Page};
 use crate::graphics::Graphics;
 use crate::layout::Layout;
 use crate::media::MediaCommand;
+
+/// Một nấc con lăn chuột (WHEEL_DELTA); touchpad gửi nhiều số nhỏ cộng dồn lại
+const WHEEL_NOTCH: i32 = 120;
 
 pub struct App {
     graphics: Graphics,
@@ -29,6 +32,8 @@ pub struct App {
     width: Spring,
     height: Spring,
     content: Content,
+    page: Page,
+    wheel: i32, // con lăn cộng dồn, chưa đủ một nấc
     hovered: bool,
     hover_button: Option<usize>,
     tracking: bool, // đã đăng ký nhận WM_MOUSELEAVE chưa?
@@ -44,13 +49,16 @@ impl App {
         clock: ClockConfig,
         commands: Sender<MediaCommand>,
     ) -> Self {
+        let content = content::current(&clock);
         Self {
             graphics,
             layout,
             clock,
             width: Spring::new(layout.collapsed.0),
             height: Spring::new(layout.collapsed.1),
-            content: content::current(&clock),
+            page: Page::initial(&content),
+            content,
+            wheel: 0,
             hovered: false,
             hover_button: None,
             tracking: false,
@@ -87,16 +95,32 @@ impl App {
             self.width.value,
             self.height.value,
             &self.content,
+            self.page,
             self.hover_button,
         )
+    }
+
+    /// Vẽ lại ngay nếu không đang ẩn hoặc đang co giãn (khi đó tick() tự vẽ)
+    fn redraw_if_idle(&self) {
+        if !self.is_animating() && !self.hidden {
+            let _ = self.redraw();
+        }
     }
 
     pub fn is_animating(&self) -> bool {
         !(self.width.is_settled() && self.height.is_settled())
     }
 
+    fn set_page(&mut self, page: Page) {
+        if page != self.page {
+            self.page = page;
+            self.hover_button = None; // nút media không còn trên trang mới
+            self.redraw_if_idle();
+        }
+    }
+
     fn buttons_active(&self) -> bool {
-        self.hovered && !self.content.title.is_empty()
+        self.hovered && self.page == Page::Media && !self.content.title.is_empty()
     }
 
     fn set_hovered(&mut self, hwnd: HWND, hovered: bool) {
@@ -173,13 +197,29 @@ impl App {
         self.set_hovered(hwnd, false);
     }
 
-    pub fn on_click(&self, x: i32, y: i32) {
+    pub fn on_click(&mut self, x: i32, y: i32) {
+        let (x, y) = (x as f32, y as f32);
+        // Bấm vào hàng chấm phân trang: sang trang kế
+        if self.layout.dots_hit(self.height.value, x, y) {
+            self.set_page(self.page.step(true));
+            return;
+        }
         if !self.buttons_active() {
             return;
         }
-        let button = self.layout.button_at(x as f32, y as f32);
+        let button = self.layout.button_at(x, y);
         if let Some(cmd) = button.and_then(MediaCommand::from_button) {
             let _ = self.commands.send(cmd);
+        }
+    }
+
+    /// Lăn chuột trên island: lăn xuống sang trang sau, lăn lên về trang trước
+    pub fn on_wheel(&mut self, delta: i16) {
+        self.wheel += i32::from(delta);
+        if self.wheel.abs() >= WHEEL_NOTCH {
+            let forward = self.wheel < 0;
+            self.wheel = 0;
+            self.set_page(self.page.step(forward));
         }
     }
 
@@ -204,11 +244,11 @@ impl App {
             return; // đang ẩn thì không vẽ; đang co giãn thì tick() tự vẽ
         }
         let new = content::current(&self.clock);
-        // Khi thu gọn chỉ thấy dòng ngắn, nên chỉ vẽ lại khi dòng đó đổi
+        // Khi thu gọn không hiện giây, nên chỉ vẽ lại khi phần nhìn thấy đổi
         let changed = if self.hovered {
             new != self.content
         } else {
-            new.short != self.content.short
+            !new.same_when_collapsed(&self.content)
         };
         if changed {
             self.content = new;
@@ -217,9 +257,18 @@ impl App {
     }
 
     pub fn on_media_changed(&mut self) {
-        self.content = content::current(&self.clock);
-        if !self.is_animating() && !self.hidden {
-            let _ = self.redraw();
+        let new = content::current(&self.clock);
+        let page = self.page.after_media_change(&self.content, &new);
+        self.content = new;
+        if page != self.page {
+            self.set_page(page); // set_page tự vẽ lại
+        } else {
+            self.redraw_if_idle();
         }
+    }
+
+    pub fn on_weather_changed(&mut self) {
+        self.content = content::current(&self.clock);
+        self.redraw_if_idle();
     }
 }

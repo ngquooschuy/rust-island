@@ -6,16 +6,22 @@ use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use crate::config::WindowConfig;
 
 // Chiều cao cố định: vị trí chữ và nút trong graphics.rs được căn theo hai số này
-const COLLAPSED_H: f32 = 36.0;
-const EXPANDED_H: f32 = 100.0;
+const COLLAPSED_H: f32 = 44.0;
+const EXPANDED_H: f32 = 116.0;
 // Cửa sổ trong suốt rộng/cao hơn island mở rộng một chút
 const MARGIN_X: f32 = 60.0;
 const MARGIN_Y: f32 = 30.0;
 
 const BTN_W: f32 = 44.0;
 const BTN_H: f32 = 26.0;
-/// Khoảng cách từ đáy island mở rộng lên đỉnh hàng nút
-const BTN_FROM_BOTTOM: f32 = 30.0;
+/// Khoảng cách từ đáy island mở rộng lên đỉnh hàng nút (chừa chỗ cho chấm phân trang)
+const BTN_FROM_BOTTOM: f32 = 46.0;
+
+/// Tâm hàng chấm phân trang cách đáy island bao nhiêu
+const DOTS_FROM_BOTTOM: f32 = 8.0;
+/// Vùng bấm quanh hàng chấm (rộng hơn chấm để dễ bấm)
+const DOTS_HIT_HALF_W: f32 = 24.0;
+const DOTS_HIT_H: f32 = 16.0;
 /// Khoảng cách giữa tâm hai nút liền nhau
 const BTN_GAP: f32 = 64.0;
 pub const BUTTON_COUNT: usize = 3;
@@ -74,6 +80,17 @@ impl Layout {
         let left = self.island_left(w);
         x >= left && x <= left + w && y >= 0.0 && y <= h
     }
+
+    /// Tâm (x, y) của hàng chấm phân trang trên island cao `h`
+    pub fn dots_center(&self, h: f32) -> (f32, f32) {
+        (self.win_w as f32 / 2.0, h - DOTS_FROM_BOTTOM)
+    }
+
+    /// Điểm (x, y) có trúng hàng chấm phân trang không?
+    pub fn dots_hit(&self, h: f32, x: f32, y: f32) -> bool {
+        let (cx, _) = self.dots_center(h);
+        (x - cx).abs() <= DOTS_HIT_HALF_W && y >= h - DOTS_HIT_H && y <= h
+    }
 }
 
 #[cfg(test)]
@@ -89,10 +106,27 @@ mod tests {
     }
 
     #[test]
-    fn default_config_gives_original_window_size() {
+    fn default_config_window_size() {
         let l = layout();
-        assert_eq!((l.win_w, l.win_h), (460, 130));
+        assert_eq!((l.win_w, l.win_h), (460, 146));
         assert_eq!(l.button_rect(1).top, 70.0);
+    }
+
+    #[test]
+    fn dots_sit_below_buttons() {
+        let l = layout();
+        let (_, dots_y) = l.dots_center(l.expanded.1);
+        assert!(dots_y - 3.0 > l.button_rect(1).bottom, "chấm đè lên nút");
+    }
+
+    #[test]
+    fn dots_hit_only_near_bottom_center() {
+        let l = layout();
+        let h = l.collapsed.1;
+        let (cx, cy) = l.dots_center(h);
+        assert!(l.dots_hit(h, cx, cy));
+        assert!(!l.dots_hit(h, cx, 5.0)); // phía trên
+        assert!(!l.dots_hit(h, cx + 60.0, cy)); // lệch sang bên
     }
 
     #[test]

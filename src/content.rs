@@ -1,9 +1,12 @@
-//! Chuỗi hiển thị trên island: đồng hồ, ngày tháng, bài đang phát.
+//! Nội dung hiển thị trên island (đồng hồ, ngày, thời tiết, pin, bài đang phát)
+//! và các trang mà người dùng lướt qua bằng con lăn chuột.
 
 use windows::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocalTime};
 
+use crate::battery::{self, Battery};
 use crate::config::ClockConfig;
 use crate::media::{self, MediaInfo};
+use crate::weather::{self, Weather};
 
 const WEEKDAYS: [&str; 7] = [
     "Chủ nhật",
@@ -14,17 +17,109 @@ const WEEKDAYS: [&str; 7] = [
     "Thứ sáu",
     "Thứ bảy",
 ];
+const WEEKDAYS_SHORT: [&str; 7] = ["CN", "T2", "T3", "T4", "T5", "T6", "T7"];
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Content {
-    /// Dòng ngắn khi thu gọn: giờ hoặc tên bài
-    pub short: String,
+    /// Giờ:phút, dùng khi thu gọn
+    pub clock: String,
     /// Giờ khi mở rộng (có giây nếu cấu hình bật)
     pub long: String,
     pub date: String,
+    /// Thứ và ngày dạng ngắn "T2 9/11", thay chỗ pin trên máy bàn
+    pub day_short: String,
+    /// "♪ Tên bài" đã cắt ngắn, dùng khi thu gọn
+    pub song: String,
     pub title: String,
     pub artist: String,
     pub playing: bool,
+    pub battery: Option<Battery>,
+    /// None khi chưa tải được hoặc đã tắt trong cấu hình
+    pub weather: Option<Weather>,
+}
+
+impl Content {
+    /// Hai nội dung có trông giống nhau khi island thu gọn không?
+    /// (khi thu gọn không hiện giây, nên không cần vẽ lại mỗi giây)
+    pub fn same_when_collapsed(&self, other: &Self) -> bool {
+        self.clock == other.clock
+            && self.day_short == other.day_short
+            && self.song == other.song
+            && self.playing == other.playing
+            && self.battery == other.battery
+            && self.weather == other.weather
+    }
+
+    /// Dòng phụ khi mở rộng trang Idle:
+    /// "Thứ hai, 09/11/2026 · Hà Nội, nhiều mây · Pin 57%"
+    pub fn detail_line(&self) -> String {
+        let mut parts = vec![self.date.clone()];
+        if let Some(w) = &self.weather {
+            parts.push(format!("{}, {}", w.place, w.sky.describe().to_lowercase()));
+        }
+        if let Some(b) = self.battery {
+            let label = if b.charging {
+                "Đang sạc"
+            } else if b.is_low() {
+                "Pin yếu"
+            } else {
+                "Pin"
+            };
+            parts.push(format!("{label} {}%", b.percent));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// Các trang của island; chấm phân trang cho biết đang ở trang nào
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    /// Đồng hồ + thời tiết
+    Idle,
+    /// Bài đang phát + nút điều khiển
+    Media,
+}
+
+impl Page {
+    pub const ALL: [Page; 2] = [Page::Idle, Page::Media];
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|&p| p == self).unwrap()
+    }
+
+    /// Trang kế tiếp (`forward`) hoặc trước đó, quay vòng
+    pub fn step(self, forward: bool) -> Self {
+        let n = Self::ALL.len();
+        let i = if forward {
+            self.index() + 1
+        } else {
+            self.index() + n - 1
+        };
+        Self::ALL[i % n]
+    }
+
+    /// Trang lúc mới mở app
+    pub fn initial(content: &Content) -> Self {
+        if content.playing && !content.title.is_empty() {
+            Self::Media
+        } else {
+            Self::Idle
+        }
+    }
+
+    /// Tự chuyển trang khi media đổi: bắt đầu phát/đổi bài thì sang Media,
+    /// hết bài thì về Idle, còn lại giữ trang người dùng đang chọn
+    pub fn after_media_change(self, old: &Content, new: &Content) -> Self {
+        let started = new.playing && !new.title.is_empty() && !old.playing;
+        let new_song = new.playing && new.title != old.title;
+        if started || new_song {
+            Self::Media
+        } else if new.title.is_empty() && !old.title.is_empty() {
+            Self::Idle
+        } else {
+            self
+        }
+    }
 }
 
 /// Cắt chuỗi còn tối đa `max` ký tự (không phải byte) và thêm "…"
@@ -37,10 +132,13 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Nội dung theo giờ hệ thống và bài đang phát ngay lúc này
+/// Nội dung theo giờ hệ thống, pin và bài đang phát ngay lúc này
 pub fn current(clock: &ClockConfig) -> Content {
     let now = unsafe { GetLocalTime() };
-    build(&now, &media::snapshot(), clock)
+    Content {
+        weather: weather::snapshot(),
+        ..build(&now, &media::snapshot(), battery::status(), clock)
+    }
 }
 
 /// "09:05" / "09:05:07" (24 giờ) hoặc "9:05 SA" / "9:05:07 CH" (12 giờ)
@@ -65,23 +163,27 @@ fn format_time(t: &SYSTEMTIME, clock: &ClockConfig, seconds: bool) -> String {
 }
 
 // Tách riêng phần không gọi Win32 để test được với thời gian giả
-fn build(t: &SYSTEMTIME, media: &MediaInfo, clock: &ClockConfig) -> Content {
-    let short = if media.playing && !media.title.is_empty() {
-        format!("♪ {}", truncate(&media.title, 14))
-    } else {
-        format_time(t, clock, false)
-    };
-
+fn build(
+    t: &SYSTEMTIME,
+    media: &MediaInfo,
+    battery: Option<Battery>,
+    clock: &ClockConfig,
+) -> Content {
+    let weekday = t.wDayOfWeek as usize;
     Content {
-        short,
+        clock: format_time(t, clock, false),
         long: format_time(t, clock, clock.show_seconds),
         date: format!(
             "{}, {:02}/{:02}/{}",
-            WEEKDAYS[t.wDayOfWeek as usize], t.wDay, t.wMonth, t.wYear
+            WEEKDAYS[weekday], t.wDay, t.wMonth, t.wYear
         ),
+        day_short: format!("{} {}/{}", WEEKDAYS_SHORT[weekday], t.wDay, t.wMonth),
+        song: format!("♪ {}", truncate(&media.title, 18)),
         title: truncate(&media.title, 28),
         artist: truncate(&media.artist, 30),
         playing: media.playing,
+        battery,
+        weather: None, // current() điền vào sau
     }
 }
 
@@ -138,27 +240,62 @@ mod tests {
         show_seconds: true,
     };
 
+    fn idle() -> Content {
+        build(&time(), &MediaInfo::default(), None, &H24)
+    }
+
+    fn with_song(playing: bool) -> Content {
+        build(&time(), &song(playing), None, &H24)
+    }
+
     #[test]
     fn no_media_shows_clock_and_date() {
-        let c = build(&time(), &MediaInfo::default(), &H24);
-        assert_eq!(c.short, "09:05");
+        let c = idle();
+        assert_eq!(c.clock, "09:05");
         assert_eq!(c.long, "09:05:07");
         assert_eq!(c.date, "Thứ hai, 09/11/2026");
+        assert_eq!(c.day_short, "T2 9/11");
         assert!(c.title.is_empty());
     }
 
     #[test]
-    fn playing_song_replaces_clock() {
-        let c = build(&time(), &song(true), &H24);
-        assert_eq!(c.short, "♪ Nơi này có anh");
+    fn song_line_has_note_and_title() {
+        let c = with_song(true);
+        assert_eq!(c.song, "♪ Nơi này có anh");
         assert!(c.playing);
     }
 
     #[test]
-    fn paused_song_keeps_clock_but_shows_title() {
-        let c = build(&time(), &song(false), &H24);
-        assert_eq!(c.short, "09:05");
-        assert_eq!(c.title, "Nơi này có anh");
+    fn battery_is_passed_through() {
+        let b = Battery {
+            percent: 57,
+            charging: false,
+        };
+        let c = build(&time(), &MediaInfo::default(), Some(b), &H24);
+        assert_eq!(c.battery, Some(b));
+    }
+
+    #[test]
+    fn detail_line_lists_date_weather_and_battery() {
+        assert_eq!(idle().detail_line(), "Thứ hai, 09/11/2026");
+
+        let c = Content {
+            weather: Some(Weather {
+                temperature: 31.0,
+                sky: crate::weather::Sky::PartlyCloudy,
+                is_day: true,
+                place: "Hà Nội".into(),
+            }),
+            battery: Some(Battery {
+                percent: 82,
+                charging: true,
+            }),
+            ..idle()
+        };
+        assert_eq!(
+            c.detail_line(),
+            "Thứ hai, 09/11/2026 · Hà Nội, có mây · Đang sạc 82%"
+        );
     }
 
     #[test]
@@ -167,7 +304,50 @@ mod tests {
             show_seconds: false,
             ..H24
         };
-        assert_eq!(build(&time(), &MediaInfo::default(), &clock).long, "09:05");
+        let c = build(&time(), &MediaInfo::default(), None, &clock);
+        assert_eq!(c.long, "09:05");
+    }
+
+    #[test]
+    fn seconds_do_not_count_when_collapsed() {
+        let mut later = idle();
+        later.long = "09:05:08".into();
+        assert!(idle().same_when_collapsed(&later));
+        later.clock = "09:06".into();
+        assert!(!idle().same_when_collapsed(&later));
+    }
+
+    #[test]
+    fn page_step_wraps_around_both_ways() {
+        assert_eq!(Page::Idle.step(true), Page::Media);
+        assert_eq!(Page::Media.step(true), Page::Idle);
+        assert_eq!(Page::Idle.step(false), Page::Media);
+    }
+
+    #[test]
+    fn initial_page_follows_playback() {
+        assert_eq!(Page::initial(&idle()), Page::Idle);
+        assert_eq!(Page::initial(&with_song(false)), Page::Idle);
+        assert_eq!(Page::initial(&with_song(true)), Page::Media);
+    }
+
+    #[test]
+    fn page_switches_to_media_when_playback_starts() {
+        let page = Page::Idle.after_media_change(&with_song(false), &with_song(true));
+        assert_eq!(page, Page::Media);
+    }
+
+    #[test]
+    fn page_returns_to_idle_when_media_disappears() {
+        let page = Page::Media.after_media_change(&with_song(true), &idle());
+        assert_eq!(page, Page::Idle);
+    }
+
+    #[test]
+    fn user_choice_is_kept_when_only_pausing() {
+        // Người dùng đang xem Idle khi nhạc phát; tạm dừng không được kéo sang trang khác
+        let page = Page::Idle.after_media_change(&with_song(true), &with_song(false));
+        assert_eq!(page, Page::Idle);
     }
 
     #[test]
