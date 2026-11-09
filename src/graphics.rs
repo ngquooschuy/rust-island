@@ -14,11 +14,12 @@ use windows::{
             Dxgi::{Common::*, *},
         },
     },
-    core::{Interface, Result, w},
+    core::{HSTRING, Interface, Result, h, w},
 };
 
+use crate::config::{Color, Config};
 use crate::content::Content;
-use crate::layout::{COLLAPSED, EXPANDED, button_rect};
+use crate::layout::Layout;
 
 pub struct Graphics {
     swap_chain: IDXGISwapChain1,
@@ -29,7 +30,10 @@ pub struct Graphics {
     fmt_title: IDWriteTextFormat,
     fmt_date: IDWriteTextFormat,
     fmt_icon: IDWriteTextFormat,
-    width: f32,
+    layout: Layout,
+    background: Color,
+    text: Color,
+    secondary: Color,
     // Không dùng trực tiếp nhưng phải giữ sống, nếu không hình sẽ biến mất
     _dcomp_device: IDCompositionDevice,
     _dcomp_target: IDCompositionTarget,
@@ -38,12 +42,14 @@ pub struct Graphics {
 
 fn make_format(
     factory: &IDWriteFactory,
+    family: &HSTRING,
     size: f32,
     weight: DWRITE_FONT_WEIGHT,
 ) -> Result<IDWriteTextFormat> {
     unsafe {
+        // Font không có trên máy thì DirectWrite tự dùng font thay thế
         let format = factory.CreateTextFormat(
-            w!("Segoe UI"),
+            family,
             None,
             weight,
             DWRITE_FONT_STYLE_NORMAL,
@@ -67,7 +73,8 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
 }
 
 impl Graphics {
-    pub fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self> {
+    pub fn new(hwnd: HWND, layout: Layout, config: &Config) -> Result<Self> {
+        let (width, height) = (layout.win_w as u32, layout.win_h as u32);
         unsafe {
             let mut d3d_device: Option<ID3D11Device> = None;
             D3D11CreateDevice(
@@ -123,11 +130,13 @@ impl Graphics {
             )?;
 
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let fmt_small = make_format(&dwrite, 16.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-            let fmt_large = make_format(&dwrite, 38.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-            let fmt_title = make_format(&dwrite, 22.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-            let fmt_date = make_format(&dwrite, 14.0, DWRITE_FONT_WEIGHT_NORMAL)?;
-            let fmt_icon = make_format(&dwrite, 18.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let family = HSTRING::from(config.font.family.as_str());
+            let fmt_small = make_format(&dwrite, &family, 16.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+            let fmt_large = make_format(&dwrite, &family, 38.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+            let fmt_title = make_format(&dwrite, &family, 22.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+            let fmt_date = make_format(&dwrite, &family, 14.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+            // Icon ⏮ ▶ ⏭ luôn dùng Segoe UI cho chắc có đủ ký tự
+            let fmt_icon = make_format(&dwrite, h!("Segoe UI"), 18.0, DWRITE_FONT_WEIGHT_NORMAL)?;
 
             let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
             let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, true)?;
@@ -145,7 +154,10 @@ impl Graphics {
                 fmt_title,
                 fmt_date,
                 fmt_icon,
-                width: width as f32,
+                layout,
+                background: config.colors.background,
+                text: config.colors.text,
+                secondary: config.colors.secondary,
                 _dcomp_device: dcomp_device,
                 _dcomp_target: dcomp_target,
                 _dcomp_visual: dcomp_visual,
@@ -153,7 +165,8 @@ impl Graphics {
         }
     }
 
-    fn set_brush(&self, r: f32, g: f32, b: f32, opacity: f32) {
+    fn set_brush(&self, color: Color, opacity: f32) {
+        let (r, g, b) = color.to_f32();
         unsafe {
             self.brush.SetColor(&D2D1_COLOR_F { r, g, b, a: 1.0 });
             self.brush.SetOpacity(opacity);
@@ -215,25 +228,26 @@ impl Graphics {
         }
     }
 
-    // Phần thân viên thuốc màu đen, rồi chữ của trạng thái thu gọn/mở rộng
+    // Phần thân viên thuốc, rồi chữ của trạng thái thu gọn/mở rộng
     fn draw_island(&self, w: f32, h: f32, content: &Content, hover_button: Option<usize>) {
-        let left = (self.width - w) / 2.0;
+        let left = self.layout.island_left(w);
         let radius = (h / 2.0).min(36.0);
         let pill = D2D1_ROUNDED_RECT {
             rect: rect(left, 0.0, left + w, h),
             radiusX: radius,
             radiusY: radius,
         };
-        self.set_brush(0.0, 0.0, 0.0, 1.0);
+        self.set_brush(self.background, 1.0);
         unsafe { self.d2d_context.FillRoundedRectangle(&pill, &self.brush) };
 
         // t: 0 = thu gọn hẳn, 1 = mở rộng hẳn. Chữ nhỏ mờ dần ở nửa đầu, chữ lớn hiện dần ở nửa sau
-        let t = ((w - COLLAPSED.0) / (EXPANDED.0 - COLLAPSED.0)).clamp(0.0, 1.0);
+        let (collapsed, expanded) = (self.layout.collapsed.0, self.layout.expanded.0);
+        let t = ((w - collapsed) / (expanded - collapsed)).clamp(0.0, 1.0);
         let alpha_small = (1.0 - 2.0 * t).clamp(0.0, 1.0);
         let alpha_big = (2.0 * t - 1.0).clamp(0.0, 1.0);
 
         if alpha_small > 0.0 {
-            self.set_brush(1.0, 1.0, 1.0, alpha_small);
+            self.set_brush(self.text, alpha_small);
             self.draw_text(
                 &content.short,
                 &self.fmt_small,
@@ -249,28 +263,33 @@ impl Graphics {
         }
     }
 
+    /// Mép trái và phải của island khi mở rộng hẳn
+    fn expanded_edges(&self) -> (f32, f32) {
+        let w = self.layout.expanded.0;
+        let left = self.layout.island_left(w);
+        (left, left + w)
+    }
+
     fn draw_clock(&self, content: &Content, alpha: f32) {
-        let el = (self.width - EXPANDED.0) / 2.0;
-        let right = el + EXPANDED.0;
-        self.set_brush(1.0, 1.0, 1.0, alpha);
+        let (el, right) = self.expanded_edges();
+        self.set_brush(self.text, alpha);
         self.draw_text(&content.long, &self.fmt_large, rect(el, 10.0, right, 66.0));
-        self.set_brush(0.7, 0.7, 0.72, alpha);
+        self.set_brush(self.secondary, alpha);
         self.draw_text(&content.date, &self.fmt_date, rect(el, 62.0, right, 90.0));
     }
 
     fn draw_media(&self, content: &Content, alpha: f32, hover_button: Option<usize>) {
-        let el = (self.width - EXPANDED.0) / 2.0;
-        let right = el + EXPANDED.0;
-        self.set_brush(1.0, 1.0, 1.0, alpha);
+        let (el, right) = self.expanded_edges();
+        self.set_brush(self.text, alpha);
         self.draw_text(&content.title, &self.fmt_title, rect(el, 10.0, right, 46.0));
-        self.set_brush(0.7, 0.7, 0.72, alpha);
+        self.set_brush(self.secondary, alpha);
         self.draw_text(&content.artist, &self.fmt_date, rect(el, 44.0, right, 68.0));
 
         let glyphs = ["⏮", if content.playing { "⏸" } else { "▶" }, "⏭"];
         for (i, glyph) in glyphs.iter().enumerate() {
-            let rect = button_rect(i);
+            let rect = self.layout.button_rect(i);
             if hover_button == Some(i) {
-                self.set_brush(1.0, 1.0, 1.0, alpha * 0.18);
+                self.set_brush(self.text, alpha * 0.18);
                 let bg = D2D1_ROUNDED_RECT {
                     rect,
                     radiusX: 10.0,
@@ -278,7 +297,7 @@ impl Graphics {
                 };
                 unsafe { self.d2d_context.FillRoundedRectangle(&bg, &self.brush) };
             }
-            self.set_brush(1.0, 1.0, 1.0, alpha);
+            self.set_brush(self.text, alpha);
             self.draw_text(glyph, &self.fmt_icon, rect);
         }
     }

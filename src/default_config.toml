@@ -1,0 +1,24 @@
+# Cấu hình Dynamic Island
+# Sửa xong: chuột phải icon khay > "Khởi động lại để áp dụng".
+# Xóa file này để quay về mặc định. Dòng bắt đầu bằng # là chú thích.
+
+[window]
+# Khoảng cách từ mép trên màn hình, đơn vị pixel (0–300)
+top = 10
+# Chiều rộng khi thu gọn (100–280) và khi mở rộng (300–700)
+collapsed_width = 160
+expanded_width = 400
+
+[colors]
+# Dạng "#RRGGBB"
+background = "#000000"
+text = "#FFFFFF"
+secondary = "#B3B3B8" # tên nghệ sĩ, ngày tháng
+
+[font]
+# Tên font đã cài trên máy, ví dụ "Segoe UI", "Arial", "Consolas"
+family = "Segoe UI"
+
+[clock]
+hour24 = true       # false: kiểu 12 giờ (SA/CH)
+show_seconds = true # hiện giây khi mở rộng

@@ -4,6 +4,7 @@
 mod animation; // lò xo cho hiệu ứng co giãn
 mod app; // trạng thái island, xử lý sự kiện
 mod autostart; // khởi động cùng Windows
+mod config; // đọc file cấu hình config.toml
 mod content; // chuỗi hiển thị: giờ, ngày, bài hát
 mod graphics; // vẽ bằng Direct2D + DirectComposition
 mod layout; // kích thước, vị trí nút
@@ -25,12 +26,13 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::{Result, w},
+    core::{HSTRING, Result, w},
 };
 
 use app::App;
+use config::Config;
 use graphics::Graphics;
-use layout::{WIN_H, WIN_TOP, WIN_W};
+use layout::Layout;
 use media::{MediaCommand, WM_MEDIA_CHANGED};
 use tray::WM_TRAY;
 
@@ -70,19 +72,19 @@ fn is_fullscreen_app_running() -> bool {
 }
 
 /// Tọa độ x để cửa sổ nằm giữa màn hình chính
-fn centered_x() -> i32 {
+fn centered_x(layout: &Layout) -> i32 {
     let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    (screen_width - WIN_W) / 2
+    (screen_width - layout.win_w) / 2
 }
 
 // Đặt cửa sổ ở giữa mép trên màn hình chính
-fn position_window(hwnd: HWND) {
+fn position_window(hwnd: HWND, layout: &Layout) {
     unsafe {
         let _ = SetWindowPos(
             hwnd,
             None,
-            centered_x(),
-            WIN_TOP,
+            centered_x(layout),
+            layout.top,
             0,
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
@@ -90,7 +92,18 @@ fn position_window(hwnd: HWND) {
     }
 }
 
-fn create_window() -> Result<HWND> {
+/// Đọc cấu hình; file lỗi thì báo cho người dùng rồi chạy tiếp với mặc định
+fn load_config() -> Config {
+    config::load().unwrap_or_else(|err| {
+        let text = HSTRING::from(format!("{err}\n\nĐang dùng cấu hình mặc định."));
+        unsafe {
+            MessageBoxW(None, &text, w!("Dynamic Island"), MB_OK | MB_ICONWARNING);
+        }
+        Config::default()
+    })
+}
+
+fn create_window(layout: &Layout) -> Result<HWND> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let class_name = w!("DynamicIslandWindow");
@@ -109,10 +122,10 @@ fn create_window() -> Result<HWND> {
             class_name,
             w!("Island"),
             WS_POPUP,
-            centered_x(),
-            WIN_TOP,
-            WIN_W,
-            WIN_H,
+            centered_x(layout),
+            layout.top,
+            layout.win_w,
+            layout.win_h,
             None,
             None,
             Some(instance.into()),
@@ -156,11 +169,13 @@ fn main() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-    let hwnd = create_window()?;
+    let config = load_config();
+    let layout = Layout::new(&config.window);
+    let hwnd = create_window(&layout)?;
 
     let (tx, rx) = mpsc::channel::<MediaCommand>();
-    let graphics = Graphics::new(hwnd, WIN_W as u32, WIN_H as u32)?;
-    let app = App::new(graphics, tx);
+    let graphics = Graphics::new(hwnd, layout, &config)?;
+    let app = App::new(graphics, layout, config.clock, tx);
     app.show_first_frame(hwnd)?;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
@@ -197,7 +212,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         }
         WM_MEDIA_CHANGED => with_app(|app| app.on_media_changed()),
         // Màn hình đổi (cắm/rút, đổi độ phân giải): đặt lại vị trí
-        WM_DISPLAYCHANGE => position_window(hwnd),
+        WM_DISPLAYCHANGE => with_app(|app| position_window(hwnd, app.layout())),
         // Icon khay: chuột phải thì hiện menu
         WM_TRAY => {
             if (lparam.0 & 0xFFFF) as u32 == WM_RBUTTONUP {
