@@ -10,6 +10,8 @@ const COLLAPSED_H: f32 = 44.0;
 const EXPANDED_H: f32 = 116.0;
 /// Trang Media khi mở rộng có khung lời bài hát: cao hơn để chứa 3 dòng lời và thanh tiến độ
 const LYRICS_H: f32 = 200.0;
+/// Thông báo tạm thời (vừa sao chép, thông báo Windows): đủ cao cho biểu tượng và 3 dòng chữ
+const ALERT_H: f32 = 84.0;
 /// Island khi tự ẩn: chỉ còn một vạch nhỏ (notch)
 const NOTCH: (f32, f32) = (72.0, 8.0);
 /// Vùng nhận chuột quanh notch rộng hơn hình vẽ (mỗi bên, và phía dưới) để dễ rê trúng
@@ -80,6 +82,11 @@ impl Layout {
     /// Bán kính bo góc của island cao `h`: thấp thì tròn hẳn hai đầu như viên thuốc
     pub fn corner_radius(h: f32) -> f32 {
         (h / 2.0).min(36.0)
+    }
+
+    /// Kích thước khi đang hiện thông báo tạm thời: rộng như lúc mở rộng, thấp hơn
+    pub fn alert_size(&self) -> (f32, f32) {
+        (self.expanded.0, ALERT_H)
     }
 
     /// Kích thước khi mở rộng; `lyrics_panel` = trang Media có khung lời bài hát

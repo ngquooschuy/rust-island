@@ -58,3 +58,9 @@ collapsed = false
 # Đầy thì xóa bài lâu không nghe nhất trước; lời quá 90 ngày được tải lại.
 # 0 = tắt (không đọc/ghi đĩa); gợi ý 10, 25 hoặc 100 (MB).
 cache_mb = 25
+
+[alerts]
+# Thông báo tạm thời trên island, kèm biểu tượng 64px của ứng dụng
+clipboard = true     # nội dung vừa sao chép (mật khẩu từ trình quản lý mật khẩu không hiện)
+notifications = true # thông báo Windows mới (lần đầu Windows có thể hỏi quyền)
+seconds = 4          # mỗi thông báo hiện bao lâu (2–30 giây); rê chuột vào thì giữ lại

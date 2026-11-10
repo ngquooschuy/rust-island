@@ -19,9 +19,11 @@ use windows::{
 };
 use windows_numerics::Vector2;
 
+use crate::alerts::{Alert, Kind};
 use crate::battery::Battery;
 use crate::config::{BackdropKind, Color, Config};
 use crate::content::{self, Content, LyricsView, Page, Progress};
+use crate::icon::Icon;
 use crate::layout::{BUTTON_COUNT, LYRICS_BUTTON, Layout};
 use crate::weather::{Sky, Weather};
 
@@ -48,7 +50,22 @@ pub struct Frame<'a> {
     pub lyrics_on: bool,
     /// Câu lời hiện trên island thu gọn (None: hiện tên bài như thường)
     pub compact_lyric: Option<CompactLyric<'a>>,
+    /// Thông báo tạm thời đang hiện (hoặc đang mờ đi)
+    pub alert: Option<AlertView<'a>>,
 }
+
+/// Thông báo tạm thời cần vẽ
+pub struct AlertView<'a> {
+    pub alert: &'a Alert,
+    /// Biểu tượng đã đưa lên card đồ họa (None: vẽ biểu tượng mặc định)
+    pub icon: Option<&'a ID2D1Bitmap1>,
+    /// 0 = chưa hiện, 1 = hiện rõ; nội dung thường của island mờ theo chiều ngược lại
+    pub alpha: f32,
+}
+
+/// Biểu tượng trong thông báo tạm thời: cạnh ô vuông và lề trái
+const ALERT_ICON: f32 = 44.0;
+const ALERT_PAD: f32 = 20.0;
 
 /// Câu lời trên island thu gọn đang trượt vào
 pub struct CompactLyric<'a> {
@@ -90,6 +107,12 @@ pub struct Graphics {
     fmt_lyric: IDWriteTextFormat,
     fmt_head: IDWriteTextFormat,
     fmt_tiny: IDWriteTextFormat,
+    /// Chữ căn trái cho thông báo tạm thời: tên app, tiêu đề, nội dung
+    fmt_alert_app: IDWriteTextFormat,
+    fmt_alert_title: IDWriteTextFormat,
+    fmt_alert_body: IDWriteTextFormat,
+    /// Biểu tượng dạng chữ của Windows (Segoe MDL2 Assets) khi app không có biểu tượng
+    fmt_symbol: IDWriteTextFormat,
     layout: Layout,
     background: Color,
     text: Color,
@@ -147,6 +170,39 @@ fn noise_pixels() -> Vec<u8> {
             [v, v, v, 0xFF]
         })
         .collect()
+}
+
+/// Ảnh Direct2D từ điểm ảnh BGRA đã nhân độ đục
+fn create_bitmap(
+    dc: &ID2D1DeviceContext,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<ID2D1Bitmap1> {
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+        colorContext: ManuallyDrop::new(None),
+    };
+    unsafe {
+        dc.CreateBitmap(
+            D2D_SIZE_U { width, height },
+            Some(pixels.as_ptr().cast()),
+            width * 4,
+            &props,
+        )
+    }
+}
+
+/// Định dạng chữ căn trái (các định dạng khác căn giữa)
+fn left_aligned(format: IDWriteTextFormat) -> Result<IDWriteTextFormat> {
+    unsafe { format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)? };
+    Ok(format)
 }
 
 fn create_noise_brush(dc: &ID2D1DeviceContext) -> Result<ID2D1BitmapBrush1> {
@@ -276,6 +332,30 @@ impl Graphics {
             let fmt_lyric = make_format(&dwrite, &family, 20.0, DWRITE_FONT_WEIGHT_BOLD)?;
             let fmt_head = make_format(&dwrite, &family, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             let fmt_tiny = make_format(&dwrite, &family, 11.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let fmt_alert_app = left_aligned(make_format(
+                &dwrite,
+                &family,
+                12.5,
+                DWRITE_FONT_WEIGHT_NORMAL,
+            )?)?;
+            let fmt_alert_title = left_aligned(make_format(
+                &dwrite,
+                &family,
+                15.0,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            )?)?;
+            let fmt_alert_body = left_aligned(make_format(
+                &dwrite,
+                &family,
+                13.5,
+                DWRITE_FONT_WEIGHT_NORMAL,
+            )?)?;
+            let fmt_symbol = make_format(
+                &dwrite,
+                h!("Segoe MDL2 Assets"),
+                20.0,
+                DWRITE_FONT_WEIGHT_NORMAL,
+            )?;
 
             let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
             let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, true)?;
@@ -298,6 +378,10 @@ impl Graphics {
                 fmt_lyric,
                 fmt_head,
                 fmt_tiny,
+                fmt_alert_app,
+                fmt_alert_title,
+                fmt_alert_body,
+                fmt_symbol,
                 layout,
                 background: config.colors.background,
                 text: config.colors.text,
@@ -411,6 +495,11 @@ impl Graphics {
         (cut(lo), f)
     }
 
+    /// Đưa biểu tượng (64px) lên card đồ họa để vẽ được
+    pub fn icon_bitmap(&self, icon: &Icon) -> Option<ID2D1Bitmap1> {
+        create_bitmap(&self.d2d_context, icon.width, icon.height, &icon.pixels).ok()
+    }
+
     /// Island thu gọn cần rộng bao nhiêu để vừa câu lời `line`
     /// (không hẹp hơn lúc thu gọn thường, không rộng hơn lúc mở rộng)
     pub fn compact_width(&self, line: &str) -> f32 {
@@ -496,6 +585,12 @@ impl Graphics {
         let reveal = (2.0 * shown - 1.0).clamp(0.0, 1.0);
         let alpha_small = (1.0 - 2.0 * t).clamp(0.0, 1.0) * reveal;
 
+        // Thông báo tạm thời hiện rõ dần, nội dung thường mờ đi tương ứng
+        let alert_alpha = frame.alert.as_ref().map_or(0.0, |a| a.alpha);
+        let rest = 1.0 - alert_alpha;
+        let (alpha_small, alpha_big, reveal) =
+            (alpha_small * rest, alpha_big * rest, reveal * rest);
+
         // Cắt theo khung viên thuốc để chữ không lòi ra ngoài lúc đang co giãn
         unsafe {
             self.d2d_context
@@ -513,10 +608,105 @@ impl Graphics {
                 Page::Media => self.draw_media_full(frame, alpha_big),
             }
         }
+        if let Some(view) = frame.alert.as_ref().filter(|a| a.alpha > 0.0) {
+            self.draw_alert(view);
+        }
         unsafe { self.d2d_context.PopAxisAlignedClip() };
         if reveal > 0.0 {
             self.draw_dots(page, h, reveal);
         }
+    }
+
+    // ---------- Thông báo tạm thời ----------
+
+    /// [biểu tượng]  Tên app
+    ///               Tiêu đề
+    ///               Nội dung
+    /// Bố cục theo kích thước cuối của thông báo, căn giữa cửa sổ; lúc island còn
+    /// đang giãn thì khung island cắt bớt phần chưa đủ chỗ
+    fn draw_alert(&self, view: &AlertView) {
+        let (w, h) = self.layout.alert_size();
+        let left = self.layout.island_left(w);
+        let alpha = view.alpha;
+        let cy = h / 2.0;
+
+        let icon_box = rect(
+            left + ALERT_PAD,
+            cy - ALERT_ICON / 2.0,
+            left + ALERT_PAD + ALERT_ICON,
+            cy + ALERT_ICON / 2.0,
+        );
+        match (view.icon, &view.alert.icon) {
+            (Some(bitmap), Some(icon)) => self.draw_icon(bitmap, icon, icon_box, alpha),
+            _ => self.draw_fallback_icon(view.alert.kind, icon_box, alpha),
+        }
+
+        let x0 = icon_box.right + 14.0;
+        let x1 = left + w - ALERT_PAD;
+        let max_w = x1 - x0;
+        let line = |text: &str, format: &IDWriteTextFormat, color: Color, top: f32, bottom: f32| {
+            if text.is_empty() {
+                return;
+            }
+            let (t, f) = self.fit_text(text, &[format], max_w);
+            self.set_brush(color, alpha);
+            self.draw_text(&t, f, rect(x0, top, x1, bottom));
+        };
+        let a = view.alert;
+        // Không có nội dung thì tiêu đề nằm giữa hơn
+        let shift = if a.body.is_empty() { 9.0 } else { 0.0 };
+        line(
+            &a.app,
+            &self.fmt_alert_app,
+            self.secondary,
+            cy - 31.0 + shift,
+            cy - 13.0 + shift,
+        );
+        line(
+            &a.title,
+            &self.fmt_alert_title,
+            self.text,
+            cy - 13.0 + shift,
+            cy + 8.0 + shift,
+        );
+        line(
+            &a.body,
+            &self.fmt_alert_body,
+            self.secondary,
+            cy + 8.0,
+            cy + 27.0,
+        );
+    }
+
+    /// Vẽ ảnh vừa khít ô (giữ tỉ lệ), thu nhỏ chất lượng cao từ bản 64px
+    fn draw_icon(&self, bitmap: &ID2D1Bitmap1, icon: &Icon, area: D2D_RECT_F, alpha: f32) {
+        let (bw, bh) = (area.right - area.left, area.bottom - area.top);
+        let scale = (bw / icon.width as f32).min(bh / icon.height as f32);
+        let (w, h) = (icon.width as f32 * scale, icon.height as f32 * scale);
+        let x = area.left + (bw - w) / 2.0;
+        let y = area.top + (bh - h) / 2.0;
+        unsafe {
+            self.d2d_context.DrawBitmap(
+                bitmap,
+                Some(&rect(x, y, x + w, y + h)),
+                alpha,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                None,
+                None,
+            );
+        }
+    }
+
+    /// Ô bo góc với biểu tượng clipboard hoặc cái chuông
+    fn draw_fallback_icon(&self, kind: Kind, area: D2D_RECT_F, alpha: f32) {
+        self.set_brush(self.secondary, alpha * 0.25);
+        self.fill(rounded(area, 10.0));
+        let glyph = match kind {
+            Kind::Clipboard => "\u{E77F}",    // Paste
+            Kind::Notification => "\u{EA8F}", // Ringer
+        };
+        self.set_brush(self.text, alpha);
+        self.draw_text(glyph, &self.fmt_symbol, area);
     }
 
     /// Hàng chấm phân trang: chấm của trang hiện tại kéo dài thành viên thuốc nhỏ

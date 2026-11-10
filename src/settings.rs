@@ -55,9 +55,12 @@ const ID_LYRICS_SHOW: i32 = 61;
 const ID_LYRICS_COLLAPSED: i32 = 62;
 const ID_CACHE: i32 = 63;
 const ID_CLEAR_CACHE: i32 = 64;
+const ID_ALERT_CLIPBOARD: i32 = 70;
+const ID_ALERT_NOTIFICATIONS: i32 = 71;
+const ID_ALERT_SECONDS: i32 = 72;
 
 /// Kích thước vùng trong cửa sổ, ở tỉ lệ 100% (96 DPI)
-const CLIENT: (i32, i32) = (640, 490);
+const CLIENT: (i32, i32) = (640, 556);
 
 const BACKDROPS: [(BackdropKind, &str); 3] = [
     (BackdropKind::None, "Không"),
@@ -605,9 +608,24 @@ fn build(b: &Builder) {
     b.button("", 362, 394, 252, ID_CLEAR_CACHE, false);
 
     // ===== Hàng nút =====
-    b.button("Mặc định", 12, 450, 100, ID_DEFAULTS, false);
-    b.button("Hủy", 420, 450, 100, ID_CANCEL, false);
-    b.button("Lưu", 528, 450, 100, ID_SAVE, true);
+    // ===== Hàng dưới, trải hết chiều ngang =====
+    b.group("Thông báo trên island", 12, 444, 616, 60);
+    b.check("Nội dung vừa sao chép", 24, 468, 190, ID_ALERT_CLIPBOARD);
+    b.check(
+        "Thông báo của Windows",
+        220,
+        468,
+        190,
+        ID_ALERT_NOTIFICATIONS,
+    );
+    b.label("Hiện trong", 430, 468, 70, -1);
+    b.edit(502, 468, 44, ID_ALERT_SECONDS, true);
+    b.label("giây", 552, 468, 60, -1);
+
+    // ===== Hàng nút =====
+    b.button("Mặc định", 12, 516, 100, ID_DEFAULTS, false);
+    b.button("Hủy", 420, 516, 100, ID_CANCEL, false);
+    b.button("Lưu", 528, 516, 100, ID_SAVE, true);
 
     let hwnd = b.parent;
     for (kind, label) in BACKDROPS {
@@ -690,6 +708,9 @@ fn fill(hwnd: HWND, config: &Config) {
     set_checked(hwnd, ID_LYRICS_COLLAPSED, config.lyrics.collapsed);
     let mb = config.lyrics.cache_mb;
     combo_select_data(hwnd, ID_CACHE, mb as usize, &format!("{mb} MB"));
+    set_checked(hwnd, ID_ALERT_CLIPBOARD, config.alerts.clipboard);
+    set_checked(hwnd, ID_ALERT_NOTIFICATIONS, config.alerts.notifications);
+    set_text(hwnd, ID_ALERT_SECONDS, &config.alerts.seconds.to_string());
     update_values(hwnd);
     update_enabled(hwnd);
 }
@@ -709,6 +730,12 @@ fn read(hwnd: HWND) -> Result<Config, &'static str> {
         .ok()
         .filter(|d| (1..=3600).contains(d))
         .ok_or("Thời gian chờ trước khi thu nhỏ phải từ 1 đến 3600 giây.")?;
+    let alert_seconds = text(hwnd, ID_ALERT_SECONDS)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|s| (2..=30).contains(s))
+        .ok_or("Thông báo trên island hiện trong 2 đến 30 giây.")?;
     let city = text(hwnd, ID_CITY).trim().to_string();
     let weather = checked(hwnd, ID_WEATHER);
     if weather && city.is_empty() {
@@ -744,6 +771,9 @@ fn read(hwnd: HWND) -> Result<Config, &'static str> {
     c.lyrics.show = checked(hwnd, ID_LYRICS_SHOW);
     c.lyrics.collapsed = checked(hwnd, ID_LYRICS_COLLAPSED);
     c.lyrics.cache_mb = combo_data(hwnd, ID_CACHE).unwrap_or(25) as u32;
+    c.alerts.clipboard = checked(hwnd, ID_ALERT_CLIPBOARD);
+    c.alerts.notifications = checked(hwnd, ID_ALERT_NOTIFICATIONS);
+    c.alerts.seconds = alert_seconds;
     Ok(c)
 }
 

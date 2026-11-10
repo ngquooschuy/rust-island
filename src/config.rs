@@ -25,6 +25,7 @@ pub struct Config {
     pub weather: WeatherConfig,
     pub autohide: AutoHideConfig,
     pub lyrics: LyricsConfig,
+    pub alerts: AlertsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -156,6 +157,28 @@ impl Default for LyricsConfig {
     }
 }
 
+/// Thông báo tạm thời trên island
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AlertsConfig {
+    /// Hiện nội dung vừa sao chép
+    pub clipboard: bool,
+    /// Hiện thông báo Windows mới
+    pub notifications: bool,
+    /// Mỗi thông báo hiện bao nhiêu giây (rê chuột vào thì giữ lại)
+    pub seconds: u32,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            clipboard: true,
+            notifications: true,
+            seconds: 4,
+        }
+    }
+}
+
 /// Notch Auto-Hide: thu nhỏ island thành một vạch nhỏ khi không dùng
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -275,6 +298,7 @@ impl Config {
         w.expanded_width = clamp_or(w.expanded_width, 320.0, 700.0, d.expanded_width);
         self.autohide.delay_seconds = self.autohide.delay_seconds.clamp(1, 3600);
         self.lyrics.cache_mb = self.lyrics.cache_mb.min(1000);
+        self.alerts.seconds = self.alerts.seconds.clamp(2, 30);
         self
     }
 }
@@ -463,6 +487,13 @@ impl Config {
             ("lyrics", "show", self.lyrics.show.to_string()),
             ("lyrics", "collapsed", self.lyrics.collapsed.to_string()),
             ("lyrics", "cache_mb", self.lyrics.cache_mb.to_string()),
+            ("alerts", "clipboard", self.alerts.clipboard.to_string()),
+            (
+                "alerts",
+                "notifications",
+                self.alerts.notifications.to_string(),
+            ),
+            ("alerts", "seconds", self.alerts.seconds.to_string()),
         ]
     }
 }
@@ -665,6 +696,8 @@ delay_seconds = 0",
         c.autohide.enabled = false;
         c.lyrics.collapsed = true;
         c.lyrics.cache_mb = 100;
+        c.alerts.notifications = false;
+        c.alerts.seconds = 9;
         for start in [DEFAULT_TOML, "", "[clock]\nhour24 = true\n"] {
             let text = with_config(start, &c);
             assert_eq!(

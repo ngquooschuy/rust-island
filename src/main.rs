@@ -1,18 +1,22 @@
 // Bản release chạy như ứng dụng cửa sổ (không có cửa sổ console đen)
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod alerts; // thông báo tạm thời: vừa sao chép, thông báo Windows
 mod animation; // lò xo cho hiệu ứng co giãn
 mod app; // trạng thái island, xử lý sự kiện
 mod autostart; // khởi động cùng Windows
 mod backdrop; // nền Blur / Acrylic phía sau island
 mod battery; // trạng thái pin
+mod clipboard; // nội dung vừa sao chép
 mod config; // đọc file cấu hình config.toml
 mod content; // nội dung hiển thị và các trang (Idle, Media)
 mod graphics; // vẽ bằng Direct2D + DirectComposition
 mod http; // HTTP GET bằng WinHTTP (thời tiết, lời bài hát)
+mod icon; // biểu tượng ứng dụng 64px và tên ứng dụng
 mod layout; // kích thước, vị trí nút
 mod lyrics; // lời bài hát chạy theo nhạc (LRCLIB + cache trên đĩa)
 mod media; // luồng nền đọc/điều khiển media
+mod notifications; // thông báo Windows mới nhất
 mod settings; // cửa sổ Cài đặt
 mod tray; // icon khay hệ thống
 mod weather; // luồng nền tải thời tiết từ Open-Meteo
@@ -239,7 +243,17 @@ fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel::<MediaCommand>();
     let graphics = Graphics::new(hwnd, layout, &config)?;
-    let app = App::new(graphics, layout, backdrop, &config, tx);
+    // HWND chứa con trỏ nên không gửi qua luồng được: đổi sang số trước
+    let hwnd_raw = hwnd.0 as isize;
+    // Thông báo tạm thời: luồng nền đọc thông báo Windows, tìm tên và biểu tượng app
+    let alerts_config = config.alerts;
+    let clips = (alerts_config.clipboard || alerts_config.notifications)
+        .then(|| alerts::start(hwnd_raw, alerts_config.notifications))
+        .filter(|_| alerts_config.clipboard);
+    if clips.is_some() {
+        clipboard::listen(hwnd);
+    }
+    let app = App::new(graphics, layout, backdrop, &config, tx, clips);
     app.show_first_frame(hwnd)?;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
@@ -248,8 +262,6 @@ fn main() -> Result<()> {
         SetTimer(Some(hwnd), app::TIMER_CLOCK, 1000, None);
     }
 
-    // HWND chứa con trỏ nên không gửi qua luồng được: đổi sang số trước
-    let hwnd_raw = hwnd.0 as isize;
     // Lời bài hát: luồng riêng, luồng media báo cho nó mỗi khi đổi bài
     let lyrics = config
         .lyrics
@@ -283,6 +295,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             with_app(|app| app.on_wheel(hwnd, delta));
         }
         WM_TIMER if wparam.0 == app::TIMER_LYRICS => with_app(|app| app.on_lyrics_tick(hwnd)),
+        WM_TIMER if wparam.0 == app::TIMER_ALERT => with_app(|app| app.on_alert_timer(hwnd)),
+        WM_TIMER if wparam.0 == app::TIMER_CLIPBOARD => {
+            with_app(|app| app.on_clipboard_timer(hwnd))
+        }
+        clipboard::WM_CLIPBOARDUPDATE => with_app(|app| app.on_clipboard_update(hwnd)),
+        alerts::WM_ALERT => with_app(|app| app.on_alerts(hwnd)),
         WM_TIMER => {
             let fullscreen = is_fullscreen_app_running();
             with_app(|app| app.on_timer(hwnd, fullscreen));

@@ -10,6 +10,7 @@ dependencies = [
  "serde_json",
  "toml",
  "windows",
+ "windows-future",
  "windows-numerics",
 ]
 

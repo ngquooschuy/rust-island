@@ -2,9 +2,11 @@
 //! `wnd_proc` trong main.rs chỉ đọc thông điệp Windows rồi gọi các hàm `on_*` ở đây.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::{
+    Win32::Graphics::Direct2D::ID2D1Bitmap1,
     Win32::{
         Foundation::HWND,
         Graphics::Gdi::{CreateRectRgn, SetWindowRgn},
@@ -16,11 +18,13 @@ use windows::{
     core::Result,
 };
 
+use crate::alerts::{self, Alert};
 use crate::animation::{LineSlide, Spring};
 use crate::backdrop::Backdrop;
+use crate::clipboard::{self, Clip};
 use crate::config::{AutoHideConfig, ClockConfig, Config};
 use crate::content::{self, Content, Page};
-use crate::graphics::{CompactLyric, Frame, Graphics};
+use crate::graphics::{AlertView, CompactLyric, Frame, Graphics};
 use crate::layout::{BUTTON_COUNT, LYRICS_BUTTON, Layout};
 use crate::media::MediaCommand;
 
@@ -32,6 +36,46 @@ pub const TIMER_CLOCK: usize = 1;
 /// Timer nhanh, chỉ chạy khi đang hiện lời bài hát, để dòng lời đổi đúng nhịp
 pub const TIMER_LYRICS: usize = 2;
 const LYRICS_TICK_MS: u32 = 150;
+/// Timer hết giờ hiện thông báo tạm thời
+pub const TIMER_ALERT: usize = 3;
+/// Timer chờ clipboard ổn định: một lần sao chép, app nguồn có thể ghi nhiều đợt liền nhau
+pub const TIMER_CLIPBOARD: usize = 4;
+const CLIPBOARD_SETTLE_MS: u32 = 150;
+/// Rê chuột lên thông báo thì kéo dài thêm từng quãng này
+const ALERT_HOLD_MS: u32 = 1500;
+/// Thông báo hiện rõ dần / mờ đi trong bao lâu
+const ALERT_FADE_IN: Duration = Duration::from_millis(260);
+const ALERT_FADE_OUT: Duration = Duration::from_millis(200);
+
+/// Thông báo tạm thời đang hiện trên island
+struct ShownAlert {
+    alert: Alert,
+    /// Biểu tượng đã đưa lên card đồ họa
+    icon: Option<ID2D1Bitmap1>,
+    since: Instant,
+    /// Lúc bắt đầu mờ đi (đã hết giờ, island đang thu về)
+    closing: Option<Instant>,
+}
+
+impl ShownAlert {
+    fn alpha(&self, now: Instant) -> f32 {
+        let ratio = |from: Instant, span: Duration| {
+            (now.saturating_duration_since(from).as_secs_f32() / span.as_secs_f32()).min(1.0)
+        };
+        match self.closing {
+            Some(t) => 1.0 - ratio(t, ALERT_FADE_OUT),
+            None => ratio(self.since, ALERT_FADE_IN),
+        }
+    }
+
+    /// Còn đang hiện rõ dần hoặc mờ đi?
+    fn fading(&self, now: Instant) -> bool {
+        match self.closing {
+            Some(t) => now.saturating_duration_since(t) < ALERT_FADE_OUT,
+            None => now.saturating_duration_since(self.since) < ALERT_FADE_IN,
+        }
+    }
+}
 
 pub struct App {
     graphics: Graphics,
@@ -61,6 +105,11 @@ pub struct App {
     hidden: bool,                  // đang ẩn vì có ứng dụng toàn màn hình?
     last_frame: Instant,
     commands: Sender<MediaCommand>,
+    /// Gửi lần sao chép sang luồng nền (None: tắt hiện nội dung vừa sao chép)
+    clips: Option<Sender<Clip>>,
+    alert_ms: u32,                // mỗi thông báo tạm thời hiện bao lâu
+    alert_queue: VecDeque<Alert>, // thông báo đang chờ tới lượt
+    alert: Option<ShownAlert>,    // thông báo đang hiện (hoặc đang mờ đi)
 }
 
 impl App {
@@ -70,6 +119,7 @@ impl App {
         backdrop: Option<Backdrop>,
         config: &Config,
         commands: Sender<MediaCommand>,
+        clips: Option<Sender<Clip>>,
     ) -> Self {
         let lyrics_enabled = config.lyrics.enabled;
         let content = content::current(&config.clock, lyrics_enabled);
@@ -100,6 +150,10 @@ impl App {
             hidden: false,
             last_frame: Instant::now(),
             commands,
+            clips,
+            alert_ms: config.alerts.seconds * 1000,
+            alert_queue: VecDeque::new(),
+            alert: None,
         }
     }
 
@@ -166,6 +220,11 @@ impl App {
                 previous: self.slide.previous.as_deref(),
                 progress: self.slide.progress(Instant::now()),
             }),
+            alert: self.alert.as_ref().map(|a| AlertView {
+                alert: &a.alert,
+                icon: a.icon.as_ref(),
+                alpha: a.alpha(Instant::now()),
+            }),
         })
     }
 
@@ -183,7 +242,15 @@ impl App {
 
     /// Đang có hiệu ứng (co giãn hoặc trượt chữ): vòng lặp chính vẽ liên tục
     pub fn is_animating(&self) -> bool {
-        self.resizing() || self.slide.is_running(Instant::now())
+        let now = Instant::now();
+        self.resizing()
+            || self.slide.is_running(now)
+            || self.alert.as_ref().is_some_and(|a| a.fading(now))
+    }
+
+    /// Đang hiện thông báo tạm thời (chưa tới lúc mờ đi)?
+    fn alert_active(&self) -> bool {
+        self.alert.as_ref().is_some_and(|a| a.closing.is_none())
     }
 
     /// Câu lời nên hiện trên island thu gọn lúc này (trang Media, đang phát, có lời đồng bộ)
@@ -221,7 +288,10 @@ impl App {
     }
 
     fn buttons_active(&self) -> bool {
-        self.hovered && self.page == Page::Media && !self.content.title.is_empty()
+        self.hovered
+            && !self.alert_active()
+            && self.page == Page::Media
+            && !self.content.title.is_empty()
     }
 
     /// Số nút bấm được trên hàng nút: 3 nút nhạc, thêm nút lời nếu bật lời bài hát
@@ -244,7 +314,10 @@ impl App {
 
     /// Kích thước island nên có theo trạng thái hiện tại
     fn target_size(&self) -> (f32, f32) {
-        if self.hovered {
+        if self.alert_active() {
+            // Thông báo tạm thời được ưu tiên, kể cả khi đang rê chuột (để đọc cho kịp)
+            self.layout.alert_size()
+        } else if self.hovered {
             // Giữ khung cao sau khi vừa tắt lời, để island không co lại ngay dưới con trỏ
             let panel = self.content.shows_lyrics_panel(self.page, self.show_lyrics)
                 || (self.keep_tall && self.content.shows_lyrics_panel(self.page, true));
@@ -320,6 +393,7 @@ impl App {
         shown
             && !self.hidden
             && !self.notch
+            && !self.alert_active()
             && self.page == Page::Media
             && self.content.playing
             && self.content.lyrics.current_line().is_some()
@@ -355,6 +429,14 @@ impl App {
             self.height.snap();
             let (w, h) = self.hit_size();
             self.set_region(hwnd, w, h);
+        }
+        // Thông báo đã mờ hẳn thì bỏ đi
+        if self
+            .alert
+            .as_ref()
+            .is_some_and(|a| a.closing.is_some() && !a.fading(now))
+        {
+            self.alert = None;
         }
         self.set_content(hwnd, self.fresh_content());
         self.redraw()
@@ -399,6 +481,11 @@ impl App {
     }
 
     pub fn on_click(&mut self, hwnd: HWND, x: i32, y: i32) {
+        // Bấm vào thông báo tạm thời: đóng nó (rồi hiện cái kế tiếp nếu có)
+        if self.alert_active() {
+            self.close_alert(hwnd);
+            return;
+        }
         let (x, y) = (x as f32, y as f32);
         // Bấm vào hàng chấm phân trang: sang trang kế
         if self.layout.dots_hit(self.height.value, x, y) {
@@ -442,6 +529,15 @@ impl App {
     pub fn on_timer(&mut self, hwnd: HWND, fullscreen: bool) {
         if fullscreen != self.hidden {
             self.hidden = fullscreen;
+            if fullscreen {
+                // Đang xem phim, chơi game: bỏ hết thông báo tạm thời, không làm phiền
+                self.alert_queue.clear();
+                self.alert = None;
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), TIMER_ALERT);
+                }
+                self.sync_target(hwnd);
+            }
             self.show(hwnd, !fullscreen);
             if !fullscreen {
                 self.set_content(hwnd, self.fresh_content());
@@ -515,6 +611,98 @@ impl App {
         self.set_content(hwnd, self.fresh_content());
         self.update_fast_timer(hwnd);
         self.redraw_if_idle();
+    }
+
+    // ---------- Thông báo tạm thời ----------
+
+    /// Windows báo clipboard đổi: chờ một chút cho app nguồn ghi xong rồi mới đọc
+    pub fn on_clipboard_update(&mut self, hwnd: HWND) {
+        if self.clips.is_some() {
+            unsafe {
+                SetTimer(Some(hwnd), TIMER_CLIPBOARD, CLIPBOARD_SETTLE_MS, None);
+            }
+        }
+    }
+
+    /// Đọc lần sao chép rồi gửi sang luồng nền tìm tên và biểu tượng app
+    pub fn on_clipboard_timer(&mut self, hwnd: HWND) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_CLIPBOARD);
+        }
+        if self.hidden {
+            return;
+        }
+        if let (Some(clips), Some(clip)) = (&self.clips, clipboard::read(hwnd)) {
+            let _ = clips.send(clip);
+        }
+    }
+
+    /// Luồng nền báo có thông báo mới
+    pub fn on_alerts(&mut self, hwnd: HWND) {
+        let fresh = alerts::take();
+        if self.hidden {
+            return;
+        }
+        for alert in fresh {
+            alerts::push(&mut self.alert_queue, alert);
+        }
+        if !self.alert_active() {
+            self.show_next_alert(hwnd);
+        }
+    }
+
+    /// Hiện thông báo kế tiếp trong hàng đợi; hết thì island thu về như cũ
+    fn show_next_alert(&mut self, hwnd: HWND) {
+        let Some(alert) = self.alert_queue.pop_front() else {
+            return;
+        };
+        let icon = alert
+            .icon
+            .as_ref()
+            .and_then(|i| self.graphics.icon_bitmap(i));
+        self.alert = Some(ShownAlert {
+            alert,
+            icon,
+            since: Instant::now(),
+            closing: None,
+        });
+        unsafe {
+            SetTimer(Some(hwnd), TIMER_ALERT, self.alert_ms, None);
+        }
+        self.wake(hwnd); // đang là notch thì hiện lại
+        self.hover_button = None;
+        self.sync_target(hwnd);
+        self.update_fast_timer(hwnd);
+        self.redraw_if_idle();
+    }
+
+    /// Đóng thông báo đang hiện: còn cái khác đang chờ thì hiện luôn, không thì mờ đi
+    fn close_alert(&mut self, hwnd: HWND) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_ALERT);
+        }
+        if !self.alert_queue.is_empty() {
+            self.show_next_alert(hwnd);
+            return;
+        }
+        if let Some(a) = &mut self.alert {
+            a.closing = Some(Instant::now());
+        }
+        self.last_active = Instant::now(); // đếm lại giờ tự ẩn từ lúc thông báo xong
+        self.sync_target(hwnd);
+        self.update_fast_timer(hwnd);
+        self.redraw_if_idle();
+    }
+
+    /// Hết giờ hiện thông báo; đang rê chuột lên thì giữ thêm một chút
+    pub fn on_alert_timer(&mut self, hwnd: HWND) {
+        if self.hovered && self.alert_active() {
+            unsafe {
+                SetTimer(Some(hwnd), TIMER_ALERT, ALERT_HOLD_MS, None);
+            }
+        } else {
+            self.close_alert(hwnd);
+        }
     }
 
     pub fn on_weather_changed(&mut self, hwnd: HWND) {
