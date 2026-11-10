@@ -13,6 +13,7 @@ mod http; // HTTP GET bằng WinHTTP (thời tiết, lời bài hát)
 mod layout; // kích thước, vị trí nút
 mod lyrics; // lời bài hát chạy theo nhạc (LRCLIB + cache trên đĩa)
 mod media; // luồng nền đọc/điều khiển media
+mod settings; // cửa sổ Cài đặt
 mod tray; // icon khay hệ thống
 mod weather; // luồng nền tải thời tiết từ Open-Meteo
 
@@ -70,10 +71,35 @@ fn read_app<R>(f: impl FnOnce(&App) -> R) -> Option<R> {
 /// Hiện menu chuột phải (từ icon khay hoặc từ chính island)
 fn show_menu(hwnd: HWND) {
     let collapsed = read_app(App::lyrics_collapsed).flatten();
-    if let Some(tray::Action::SetLyricsCollapsed(on)) = tray::show_menu(hwnd, collapsed) {
-        with_app(|app| app.set_lyrics_collapsed(hwnd, on));
-        // Ghi vào file cấu hình để lần sau mở lên vẫn giữ; lỗi thì chỉ mất lựa chọn này
-        let _ = config::save_lyrics_collapsed(on);
+    match tray::show_menu(hwnd, collapsed) {
+        Some(tray::Action::OpenSettings) => settings::open(hwnd),
+        Some(tray::Action::SetLyricsCollapsed(on)) => {
+            with_app(|app| app.set_lyrics_collapsed(hwnd, on));
+            // Ghi vào file cấu hình để lần sau mở lên vẫn giữ; lỗi thì chỉ mất lựa chọn này
+            let _ = config::save_lyrics_collapsed(on);
+        }
+        None => {}
+    }
+}
+
+/// Mở một bản mới của chương trình rồi đóng bản hiện tại (`hwnd` là cửa sổ island),
+/// để bản mới đọc lại file cấu hình
+pub fn restart(hwnd: HWND) {
+    let started = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).spawn());
+    if started.is_ok() {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+}
+
+/// Chuyển một thông điệp tới cửa sổ nhận nó (cửa sổ Cài đặt được xử lý phím Tab/Enter/Esc trước)
+fn dispatch(msg: &MSG) {
+    if !settings::pre_translate(msg) {
+        unsafe {
+            let _ = TranslateMessage(msg);
+            DispatchMessageW(msg);
+        }
     }
 }
 
@@ -180,8 +206,7 @@ fn run_message_loop(hwnd: HWND) {
                     if msg.message == WM_QUIT {
                         break 'main;
                     }
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                    dispatch(&msg);
                 }
                 with_app(|app| {
                     let _ = app.tick(hwnd);
@@ -190,8 +215,7 @@ fn run_message_loop(hwnd: HWND) {
                 if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     break 'main;
                 }
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+                dispatch(&msg);
             }
         }
     }
@@ -273,12 +297,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 position_window(backdrop.hwnd(), app.layout());
             }
         }),
-        // Icon khay: chuột phải thì hiện menu
-        WM_TRAY => {
-            if (lparam.0 & 0xFFFF) as u32 == WM_RBUTTONUP {
-                show_menu(hwnd);
-            }
-        }
+        // Icon khay: chuột phải thì hiện menu, nhấp đúp thì mở Cài đặt
+        WM_TRAY => match (lparam.0 & 0xFFFF) as u32 {
+            WM_RBUTTONUP => show_menu(hwnd),
+            WM_LBUTTONDBLCLK => settings::open(hwnd),
+            _ => {}
+        },
         // Chuột phải lên island: cùng menu với icon khay
         WM_RBUTTONUP => show_menu(hwnd),
         WM_DESTROY => {

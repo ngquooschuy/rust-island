@@ -5,7 +5,6 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -363,9 +362,7 @@ fn set_value(text: &str, section: &str, key: &str, value: &str) -> String {
                     let line = &lines[i];
                     let eq = line.find('=').unwrap_or(0) + 1;
                     let from = eq + (line[eq..].len() - line[eq..].trim_start().len());
-                    let to = line[from..]
-                        .find(|c: char| c.is_whitespace() || c == '#')
-                        .map_or(line.len(), |n| from + n);
+                    let to = value_end(line, from);
                     lines[i] = format!("{}{value}{}", &line[..from], &line[to..]);
                 }
                 None => {
@@ -386,9 +383,102 @@ fn set_value(text: &str, section: &str, key: &str, value: &str) -> String {
     out
 }
 
-/// Ghi lựa chọn "lời bài hát trên island thu gọn" vào file cấu hình,
-/// để lần mở sau vẫn giữ (chỉ sửa đúng một dòng)
-pub fn save_lyrics_collapsed(on: bool) -> io::Result<()> {
+/// Vị trí ngay sau giá trị bắt đầu ở `from` trong một dòng TOML:
+/// chuỗi "..." thì tới hết dấu ngoặc kép đóng, còn lại thì tới khoảng trắng hoặc #
+fn value_end(line: &str, from: usize) -> usize {
+    let rest = &line[from..];
+    if let Some(inner) = rest.strip_prefix('"') {
+        let mut escaped = false;
+        for (i, c) in inner.char_indices() {
+            match c {
+                '\\' if !escaped => escaped = true,
+                '"' if !escaped => return from + 1 + i + 1,
+                _ => escaped = false,
+            }
+        }
+        return line.len();
+    }
+    rest.find(|c: char| c.is_whitespace() || c == '#')
+        .map_or(line.len(), |n| from + n)
+}
+
+/// Chuỗi TOML trong ngoặc kép (thoát dấu \ và ")
+fn quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+impl fmt::Display for Color {
+    /// "#RRGGBB" khi đục hẳn, "#RRGGBBAA" khi trong suốt
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "#{:02X}{:02X}{:02X}", self.r, self.g, self.b)?;
+        if self.is_translucent() {
+            write!(f, "{:02X}", self.a)?;
+        }
+        Ok(())
+    }
+}
+
+impl BackdropKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Blur => "blur",
+            Self::Acrylic => "acrylic",
+        }
+    }
+}
+
+impl Config {
+    /// Mọi giá trị dạng (mục, tên, giá trị TOML), theo đúng thứ tự trong file mẫu
+    fn entries(&self) -> Vec<(&'static str, &'static str, String)> {
+        let (w, c) = (&self.window, &self.colors);
+        let color = |c: Color| quoted(&c.to_string());
+        vec![
+            ("window", "top", w.top.to_string()),
+            ("window", "collapsed_width", w.collapsed_width.to_string()),
+            ("window", "expanded_width", w.expanded_width.to_string()),
+            ("window", "backdrop", quoted(w.backdrop.name())),
+            ("colors", "background", color(c.background)),
+            ("colors", "text", color(c.text)),
+            ("colors", "secondary", color(c.secondary)),
+            ("colors", "accent", color(c.accent)),
+            ("font", "family", quoted(&self.font.family)),
+            ("clock", "hour24", self.clock.hour24.to_string()),
+            ("clock", "show_seconds", self.clock.show_seconds.to_string()),
+            ("weather", "enabled", self.weather.enabled.to_string()),
+            ("weather", "city", quoted(&self.weather.city)),
+            ("weather", "fahrenheit", self.weather.fahrenheit.to_string()),
+            ("autohide", "enabled", self.autohide.enabled.to_string()),
+            (
+                "autohide",
+                "delay_seconds",
+                self.autohide.delay_seconds.to_string(),
+            ),
+            (
+                "autohide",
+                "stay_while_playing",
+                self.autohide.stay_while_playing.to_string(),
+            ),
+            ("lyrics", "enabled", self.lyrics.enabled.to_string()),
+            ("lyrics", "show", self.lyrics.show.to_string()),
+            ("lyrics", "collapsed", self.lyrics.collapsed.to_string()),
+            ("lyrics", "cache_mb", self.lyrics.cache_mb.to_string()),
+        ]
+    }
+}
+
+/// Nội dung file sau khi ghi `config` vào `text` (giữ chú thích của file cũ)
+fn with_config(text: &str, config: &Config) -> String {
+    config
+        .entries()
+        .into_iter()
+        .fold(text.to_string(), |text, (section, key, value)| {
+            set_value(&text, section, key, &value)
+        })
+}
+
+/// Đọc nội dung file hiện tại (chưa có thì lấy file mẫu), sửa bằng `edit`, rồi ghi lại
+fn edit_file(edit: impl FnOnce(&str) -> String) -> io::Result<()> {
     let Some(path) = path() else { return Ok(()) };
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -398,19 +488,18 @@ pub fn save_lyrics_collapsed(on: bool) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(
-        &path,
-        set_value(&text, "lyrics", "collapsed", &on.to_string()),
-    )
+    fs::write(&path, edit(&text))
 }
 
-/// Mở file cấu hình bằng Notepad (tạo file mặc định nếu chưa có)
-pub fn open_in_editor() {
-    let Some(path) = path() else { return };
-    if !path.exists() {
-        let _ = write_default(&path);
-    }
-    let _ = Command::new("notepad.exe").arg(&path).spawn();
+/// Lưu toàn bộ cấu hình (cửa sổ Cài đặt gọi khi bấm Lưu)
+pub fn save(config: &Config) -> io::Result<()> {
+    edit_file(|text| with_config(text, config))
+}
+
+/// Ghi lựa chọn "lời bài hát trên island thu gọn" vào file cấu hình,
+/// để lần mở sau vẫn giữ (chỉ sửa đúng một dòng)
+pub fn save_lyrics_collapsed(on: bool) -> io::Result<()> {
+    edit_file(|text| set_value(text, "lyrics", "collapsed", &on.to_string()))
 }
 
 #[cfg(test)]
@@ -548,6 +637,51 @@ delay_seconds = 0",
             set_value("", "lyrics", "collapsed", "true"),
             "[lyrics]\ncollapsed = true\n"
         );
+    }
+
+    #[test]
+    fn set_value_replaces_whole_quoted_strings() {
+        let text = "[weather]\ncity = \"Hà Nội\"     # tên thành phố\n";
+        assert_eq!(
+            set_value(text, "weather", "city", &quoted("Hồ Chí Minh")),
+            "[weather]\ncity = \"Hồ Chí Minh\"     # tên thành phố\n"
+        );
+        let text = "[font]\nfamily = \"a \\\" # b\" # chú thích\n";
+        assert_eq!(
+            set_value(text, "font", "family", "\"X\""),
+            "[font]\nfamily = \"X\" # chú thích\n"
+        );
+    }
+
+    #[test]
+    fn saved_config_reads_back_the_same() {
+        let mut c = Config::default();
+        c.window.top = 42;
+        c.window.expanded_width = 512.0;
+        c.window.backdrop = BackdropKind::Acrylic;
+        c.colors.background = Color::rgba(1, 2, 3, 0x80);
+        c.font.family = "Cascadia Code".into();
+        c.weather.city = "Thành phố \"HCM\" \\ Sài Gòn".into();
+        c.autohide.enabled = false;
+        c.lyrics.collapsed = true;
+        c.lyrics.cache_mb = 100;
+        for start in [DEFAULT_TOML, "", "[clock]\nhour24 = true\n"] {
+            let text = with_config(start, &c);
+            assert_eq!(
+                Config::parse(&text).unwrap(),
+                c,
+                "từ:\n{start}\nra:\n{text}"
+            );
+        }
+        // Lưu lại mặc định lên file mẫu thì không đổi gì
+        assert_eq!(with_config(DEFAULT_TOML, &Config::default()), DEFAULT_TOML);
+    }
+
+    #[test]
+    fn color_display_round_trips() {
+        for s in ["#0F1112", "#0F111290", "#FFFFFF00"] {
+            assert_eq!(s.parse::<Color>().unwrap().to_string(), s);
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 # Cấu hình Dynamic Island
-# Sửa xong: chuột phải icon khay > "Khởi động lại để áp dụng".
+# Không cần sửa tay: chuột phải lên island hoặc icon khay > "Cài đặt…".
+# File này do cửa sổ Cài đặt tự ghi. Nếu vẫn sửa tay thì thoát app rồi mở lại để áp dụng.
 # Xóa file này để quay về mặc định. Dòng bắt đầu bằng # là chú thích.
 
 [window]

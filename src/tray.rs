@@ -11,37 +11,22 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::{HSTRING, PCWSTR, Result, w},
+    core::{PCWSTR, Result, w},
 };
-
-use crate::{autostart, config, lyrics};
 
 /// Thông điệp Windows gửi về cửa sổ khi có sự kiện chuột trên icon khay
 pub const WM_TRAY: u32 = WM_APP + 2;
 
 const TRAY_ID: u32 = 1;
-const ID_AUTOSTART: usize = 1;
+const ID_SETTINGS: usize = 1;
 const ID_EXIT: usize = 2;
-const ID_OPEN_CONFIG: usize = 3;
-const ID_RESTART: usize = 4;
-const ID_CLEAR_LYRICS: usize = 5;
-const ID_LYRICS_COLLAPSED: usize = 6;
+const ID_LYRICS_COLLAPSED: usize = 3;
 
-/// Mục menu cần trạng thái của island; main.rs làm tiếp
+/// Mục menu cần tới trạng thái của app; main.rs làm tiếp
 pub enum Action {
+    OpenSettings,
     /// Bật/tắt lời bài hát trên island thu gọn (giá trị mới)
     SetLyricsCollapsed(bool),
-}
-
-/// Mở một bản mới của chương trình rồi đóng bản hiện tại,
-/// để bản mới đọc lại file cấu hình
-fn restart(hwnd: HWND) {
-    let started = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).spawn());
-    if started.is_ok() {
-        unsafe {
-            let _ = DestroyWindow(hwnd);
-        }
-    }
 }
 
 pub fn add(hwnd: HWND) -> Result<()> {
@@ -81,20 +66,9 @@ pub fn show_menu(hwnd: HWND, lyrics_collapsed: Option<bool>) -> Option<Action> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
 
-        let autostart_flags = if autostart::is_enabled() {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        let _ = AppendMenuW(
-            menu,
-            autostart_flags,
-            ID_AUTOSTART,
-            w!("Khởi động cùng Windows"),
-        );
-        let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, w!("Mở file cấu hình"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_RESTART, w!("Khởi động lại để áp dụng"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Cài đặt…"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // Tùy chọn hay bật/tắt nhất được để ngay trong menu cho nhanh
         let collapsed_flags = match lyrics_collapsed {
             Some(true) => MF_STRING | MF_CHECKED,
             Some(false) => MF_STRING,
@@ -106,22 +80,6 @@ pub fn show_menu(hwnd: HWND, lyrics_collapsed: Option<bool>) -> Option<Action> {
             ID_LYRICS_COLLAPSED,
             w!("Hiện lời bài hát trên island thu gọn"),
         );
-        // Bộ nhớ đệm lời bài hát: hiện số bài và dung lượng; trống hoặc đang tắt thì làm mờ
-        let (label, flags) = match lyrics::cache_summary() {
-            Some((count, summary)) => {
-                let flags = if count == 0 {
-                    MF_STRING | MF_GRAYED
-                } else {
-                    MF_STRING
-                };
-                (format!("Xóa bộ nhớ đệm lời bài hát ({summary})"), flags)
-            }
-            None => (
-                "Bộ nhớ đệm lời bài hát: đang tắt".to_string(),
-                MF_STRING | MF_GRAYED,
-            ),
-        };
-        let _ = AppendMenuW(menu, flags, ID_CLEAR_LYRICS, &HSTRING::from(label));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Thoát"));
 
@@ -146,10 +104,7 @@ pub fn show_menu(hwnd: HWND, lyrics_collapsed: Option<bool>) -> Option<Action> {
                 let on = !lyrics_collapsed.unwrap_or(true);
                 return Some(Action::SetLyricsCollapsed(on));
             }
-            ID_AUTOSTART => autostart::set(!autostart::is_enabled()),
-            ID_OPEN_CONFIG => config::open_in_editor(),
-            ID_RESTART => restart(hwnd),
-            ID_CLEAR_LYRICS => lyrics::clear_cache(),
+            ID_SETTINGS => return Some(Action::OpenSettings),
             ID_EXIT => {
                 let _ = DestroyWindow(hwnd);
             }
