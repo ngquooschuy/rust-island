@@ -53,9 +53,18 @@ fn create_window((x, y, w, h): (i32, i32, i32, i32)) -> Result<HWND> {
             ..Default::default()
         };
         RegisterClassExW(&wc);
-        // WS_EX_NOREDIRECTIONBITMAP: không có bề mặt GDI, chỉ có hình của Composition
-        CreateWindowExW(
-            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        // WS_EX_NOREDIRECTIONBITMAP: không có bề mặt GDI, chỉ có hình của Composition.
+        // WS_EX_LAYERED + WS_EX_TRANSPARENT: chuột đi xuyên qua, như thể không có cửa sổ này.
+        // Không có hai cờ này thì cả khung cửa sổ (rộng hơn island nhiều) chặn mọi cú bấm
+        // vào ứng dụng phía sau, kể cả chỗ trong suốt
+        let ex = WS_EX_NOREDIRECTIONBITMAP
+            | WS_EX_LAYERED
+            | WS_EX_TRANSPARENT
+            | WS_EX_TOPMOST
+            | WS_EX_TOOLWINDOW
+            | WS_EX_NOACTIVATE;
+        let hwnd = CreateWindowExW(
+            ex,
             class_name,
             w!("Island backdrop"),
             WS_POPUP,
@@ -67,7 +76,10 @@ fn create_window((x, y, w, h): (i32, i32, i32, i32)) -> Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )
+        )?;
+        // Cửa sổ layered phải đặt độ đục một lần thì mới hiện (255 = giữ nguyên hình)
+        SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
+        Ok(hwnd)
     }
 }
 
