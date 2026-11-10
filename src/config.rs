@@ -34,6 +34,8 @@ pub struct WindowConfig {
     pub top: i32,
     pub collapsed_width: f32,
     pub expanded_width: f32,
+    /// Hiệu ứng làm mờ nội dung phía sau island (cần nền `#RRGGBBAA` trong suốt mới thấy)
+    pub backdrop: BackdropKind,
 }
 
 impl Default for WindowConfig {
@@ -42,8 +44,22 @@ impl Default for WindowConfig {
             top: 10,
             collapsed_width: 220.0,
             expanded_width: 400.0,
+            backdrop: BackdropKind::None,
         }
     }
+}
+
+/// Nền phía sau island, trong file TOML viết "none", "blur" hoặc "acrylic"
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackdropKind {
+    /// Không làm mờ: chỗ nền trong suốt thấy rõ desktop phía sau
+    #[default]
+    None,
+    /// Làm mờ đơn thuần
+    Blur,
+    /// Kính mờ Acrylic của Windows: làm mờ thêm lớp hạt nhiễu và ánh màu nền
+    Acrylic,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -124,6 +140,8 @@ pub struct LyricsConfig {
     pub enabled: bool,
     /// Hiện khung lời khi mở rộng trang nhạc (nút bên phải bật/tắt được trong lúc dùng)
     pub show: bool,
+    /// Hiện câu đang hát ngay trên island thu gọn (bật/tắt trong menu chuột phải)
+    pub collapsed: bool,
     /// Giới hạn bộ nhớ đệm trên đĩa (MB); 0 = tắt, không đọc/ghi đĩa
     pub cache_mb: u32,
 }
@@ -133,6 +151,7 @@ impl Default for LyricsConfig {
         Self {
             enabled: true,
             show: true,
+            collapsed: false,
             cache_mb: 25,
         }
     }
@@ -171,7 +190,8 @@ impl AutoHideConfig {
     }
 }
 
-/// Màu RGB, trong file TOML viết dạng chuỗi "#RRGGBB".
+/// Màu RGBA, trong file TOML viết dạng chuỗi "#RRGGBB" (đục hẳn) hoặc "#RRGGBBAA"
+/// (AA là độ đục: 00 = trong suốt, FF = đục hẳn).
 /// `try_from = "String"`: serde đọc ra String trước, rồi đổi sang Color bằng `TryFrom`
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(try_from = "String")]
@@ -179,17 +199,27 @@ pub struct Color {
     pub r: u8,
     pub g: u8,
     pub b: u8,
+    pub a: u8,
 }
 
 impl Color {
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b }
+        Self::rgba(r, g, b, 0xFF)
     }
 
-    /// Ba kênh màu trong khoảng 0.0–1.0, kiểu Direct2D cần
-    pub fn to_f32(self) -> (f32, f32, f32) {
+    pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { r, g, b, a }
+    }
+
+    /// Bốn kênh (r, g, b, độ đục) trong khoảng 0.0–1.0, kiểu Direct2D cần
+    pub fn to_f32(self) -> (f32, f32, f32, f32) {
         let f = |c: u8| f32::from(c) / 255.0;
-        (f(self.r), f(self.g), f(self.b))
+        (f(self.r), f(self.g), f(self.b), f(self.a))
+    }
+
+    /// Có nhìn xuyên qua được không (độ đục dưới FF)?
+    pub fn is_translucent(self) -> bool {
+        self.a < 0xFF
     }
 }
 
@@ -199,11 +229,14 @@ impl FromStr for Color {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let hex = s.strip_prefix('#').unwrap_or(s);
         // Kiểm tra trước để cắt chuỗi theo byte bên dưới không bao giờ panic
-        if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(format!("màu \"{s}\" không hợp lệ, cần dạng \"#RRGGBB\""));
+        if !matches!(hex.len(), 6 | 8) || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "màu \"{s}\" không hợp lệ, cần dạng \"#RRGGBB\" hoặc \"#RRGGBBAA\""
+            ));
         }
         let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap();
-        Ok(Self::rgb(channel(0), channel(2), channel(4)))
+        let alpha = if hex.len() == 8 { channel(6) } else { 0xFF };
+        Ok(Self::rgba(channel(0), channel(2), channel(4), alpha))
     }
 }
 
@@ -237,7 +270,7 @@ impl Config {
         let d = WindowConfig::default();
         let w = &mut self.window;
         w.top = w.top.clamp(0, 300);
-        // Thu gọn luôn hẹp hơn mở rộng, để hiệu ứng chuyển chữ không chia cho 0.
+        // Thu gọn luôn hẹp hơn mở rộng: câu lời trên island thu gọn giãn trong khoảng giữa hai số.
         // Dưới 180 thì đồng hồ và pin ở Idle View không đủ chỗ
         w.collapsed_width = clamp_or(w.collapsed_width, 180.0, 300.0, d.collapsed_width);
         w.expanded_width = clamp_or(w.expanded_width, 320.0, 700.0, d.expanded_width);
@@ -294,6 +327,81 @@ pub fn load() -> Result<Config, LoadError> {
         }
         Err(e) => Err(LoadError::Io(path, e)),
     }
+}
+
+/// Đổi giá trị `key` trong mục `[section]` của nội dung TOML mà vẫn giữ nguyên chú thích,
+/// khoảng trắng và mọi dòng khác (người dùng có thể đã tự sửa file).
+/// Chưa có dòng đó thì thêm vào cuối mục; chưa có mục thì thêm mục vào cuối file.
+/// Chỉ dùng cho giá trị đơn giản (true/false, số), không có dấu # bên trong
+fn set_value(text: &str, section: &str, key: &str, value: &str) -> String {
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    // Bỏ chú thích cuối dòng trước khi so tên mục: "[lyrics] # ..." vẫn là mục lyrics
+    let code = |line: &str| line.split('#').next().unwrap_or("").trim().to_string();
+    let header = format!("[{section}]");
+    let is_key = |line: &str| {
+        code(line)
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    };
+
+    match lines.iter().position(|l| code(l) == header) {
+        None => {
+            if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push(header);
+            lines.push(format!("{key} = {value}"));
+        }
+        Some(start) => {
+            let end = (start + 1..lines.len())
+                .find(|&i| code(&lines[i]).starts_with('['))
+                .unwrap_or(lines.len());
+            match (start + 1..end).find(|&i| is_key(&lines[i])) {
+                Some(i) => {
+                    // Chỉ thay chữ của giá trị, giữ khoảng trắng và chú thích phía sau
+                    let line = &lines[i];
+                    let eq = line.find('=').unwrap_or(0) + 1;
+                    let from = eq + (line[eq..].len() - line[eq..].trim_start().len());
+                    let to = line[from..]
+                        .find(|c: char| c.is_whitespace() || c == '#')
+                        .map_or(line.len(), |n| from + n);
+                    lines[i] = format!("{}{value}{}", &line[..from], &line[to..]);
+                }
+                None => {
+                    // Thêm sau dòng có chữ cuối cùng của mục (bỏ qua dòng trống ở cuối mục)
+                    let mut at = end;
+                    while at > start + 1 && lines[at - 1].trim().is_empty() {
+                        at -= 1;
+                    }
+                    lines.insert(at, format!("{key} = {value}"));
+                }
+            }
+        }
+    }
+    let mut out = lines.join(newline);
+    if text.is_empty() || text.ends_with('\n') {
+        out.push_str(newline);
+    }
+    out
+}
+
+/// Ghi lựa chọn "lời bài hát trên island thu gọn" vào file cấu hình,
+/// để lần mở sau vẫn giữ (chỉ sửa đúng một dòng)
+pub fn save_lyrics_collapsed(on: bool) -> io::Result<()> {
+    let Some(path) = path() else { return Ok(()) };
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => DEFAULT_TOML.to_string(),
+        Err(e) => return Err(e),
+    };
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(
+        &path,
+        set_value(&text, "lyrics", "collapsed", &on.to_string()),
+    )
 }
 
 /// Mở file cấu hình bằng Notepad (tạo file mặc định nếu chưa có)
@@ -412,14 +520,91 @@ delay_seconds = 0",
     }
 
     #[test]
+    fn set_value_replaces_only_the_value() {
+        let text = "[window]\ncollapsed = 1\n\n[lyrics]\nshow = true    # chú thích\ncollapsed = false  # giữ nguyên\n";
+        let out = set_value(text, "lyrics", "collapsed", "true");
+        assert_eq!(
+            out,
+            "[window]\ncollapsed = 1\n\n[lyrics]\nshow = true    # chú thích\ncollapsed = true  # giữ nguyên\n"
+        );
+        let edited = set_value(DEFAULT_TOML, "lyrics", "collapsed", "true");
+        assert!(Config::parse(&edited).unwrap().lyrics.collapsed);
+    }
+
+    #[test]
+    fn set_value_adds_missing_key_or_section() {
+        // Thiếu dòng: thêm vào cuối mục, trước dòng trống và mục kế tiếp
+        let text = "[lyrics]\nshow = true\n\n[clock]\nhour24 = true\n";
+        assert_eq!(
+            set_value(text, "lyrics", "collapsed", "true"),
+            "[lyrics]\nshow = true\ncollapsed = true\n\n[clock]\nhour24 = true\n"
+        );
+        // Thiếu cả mục
+        assert_eq!(
+            set_value("[clock]\nhour24 = true", "lyrics", "collapsed", "false"),
+            "[clock]\nhour24 = true\n\n[lyrics]\ncollapsed = false"
+        );
+        assert_eq!(
+            set_value("", "lyrics", "collapsed", "true"),
+            "[lyrics]\ncollapsed = true\n"
+        );
+    }
+
+    #[test]
+    fn set_value_keeps_windows_line_endings() {
+        let out = set_value(
+            "[lyrics]\r\ncollapsed = false\r\n",
+            "lyrics",
+            "collapsed",
+            "true",
+        );
+        assert_eq!(out, "[lyrics]\r\ncollapsed = true\r\n");
+    }
+
+    #[test]
+    fn set_value_ignores_similar_keys_and_comments() {
+        let text = "[lyrics]\ncollapsed_x = 1\n# collapsed = false\n";
+        assert_eq!(
+            set_value(text, "lyrics", "collapsed", "true"),
+            "[lyrics]\ncollapsed_x = 1\n# collapsed = false\ncollapsed = true\n"
+        );
+    }
+
+    #[test]
+    fn backdrop_kinds() {
+        let c = Config::parse("[window]\nbackdrop = \"acrylic\"").unwrap();
+        assert_eq!(c.window.backdrop, BackdropKind::Acrylic);
+        assert!(Config::parse("[window]\nbackdrop = \"glass\"").is_err());
+    }
+
+    #[test]
+    fn color_with_alpha_channel() {
+        assert_eq!("#0F111280".parse(), Ok(Color::rgba(0x0F, 0x11, 0x12, 0x80)));
+        assert!(!"#0F1112".parse::<Color>().unwrap().is_translucent());
+        assert!("#0F1112FE".parse::<Color>().unwrap().is_translucent());
+        let c = Config::parse("[colors]\nbackground = \"#00000000\"").unwrap();
+        assert_eq!(c.colors.background.a, 0);
+    }
+
+    #[test]
     fn color_rejects_bad_input_without_panicking() {
-        for bad in ["", "#12345", "#1234567", "#GG0000", "#ÀÀÀ", "#+12345"] {
+        let bad_inputs = [
+            "",
+            "#12345",
+            "#1234567",
+            "#123456789",
+            "#GG0000",
+            "#ÀÀÀ",
+            "#+12345",
+        ];
+        for bad in bad_inputs {
             assert!(bad.parse::<Color>().is_err(), "{bad} lẽ ra phải lỗi");
         }
     }
 
     #[test]
     fn color_to_f32_spans_zero_to_one() {
-        assert_eq!(Color::rgb(0, 255, 0).to_f32(), (0.0, 1.0, 0.0));
+        assert_eq!(Color::rgb(0, 255, 0).to_f32(), (0.0, 1.0, 0.0, 1.0));
+        assert_eq!(Color::rgba(0, 0, 0, 0).to_f32().3, 0.0);
     }
 }

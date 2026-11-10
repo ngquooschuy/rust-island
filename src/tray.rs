@@ -25,6 +25,13 @@ const ID_EXIT: usize = 2;
 const ID_OPEN_CONFIG: usize = 3;
 const ID_RESTART: usize = 4;
 const ID_CLEAR_LYRICS: usize = 5;
+const ID_LYRICS_COLLAPSED: usize = 6;
+
+/// Mục menu cần trạng thái của island; main.rs làm tiếp
+pub enum Action {
+    /// Bật/tắt lời bài hát trên island thu gọn (giá trị mới)
+    SetLyricsCollapsed(bool),
+}
 
 /// Mở một bản mới của chương trình rồi đóng bản hiện tại,
 /// để bản mới đọc lại file cấu hình
@@ -68,10 +75,11 @@ pub fn remove(hwnd: HWND) {
     }
 }
 
-/// Hiện menu chuột phải và xử lý mục được chọn
-pub fn show_menu(hwnd: HWND) {
+/// Hiện menu chuột phải và xử lý mục được chọn.
+/// `lyrics_collapsed`: tùy chọn lời trên island thu gọn (None = đã tắt lời bài hát)
+pub fn show_menu(hwnd: HWND, lyrics_collapsed: Option<bool>) -> Option<Action> {
     unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
+        let menu = CreatePopupMenu().ok()?;
 
         let autostart_flags = if autostart::is_enabled() {
             MF_STRING | MF_CHECKED
@@ -86,6 +94,18 @@ pub fn show_menu(hwnd: HWND) {
         );
         let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, w!("Mở file cấu hình"));
         let _ = AppendMenuW(menu, MF_STRING, ID_RESTART, w!("Khởi động lại để áp dụng"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let collapsed_flags = match lyrics_collapsed {
+            Some(true) => MF_STRING | MF_CHECKED,
+            Some(false) => MF_STRING,
+            None => MF_STRING | MF_GRAYED,
+        };
+        let _ = AppendMenuW(
+            menu,
+            collapsed_flags,
+            ID_LYRICS_COLLAPSED,
+            w!("Hiện lời bài hát trên island thu gọn"),
+        );
         // Bộ nhớ đệm lời bài hát: hiện số bài và dung lượng; trống hoặc đang tắt thì làm mờ
         let (label, flags) = match lyrics::cache_summary() {
             Some((count, summary)) => {
@@ -122,6 +142,10 @@ pub fn show_menu(hwnd: HWND) {
         let _ = DestroyMenu(menu);
 
         match cmd.0 as usize {
+            ID_LYRICS_COLLAPSED => {
+                let on = !lyrics_collapsed.unwrap_or(true);
+                return Some(Action::SetLyricsCollapsed(on));
+            }
             ID_AUTOSTART => autostart::set(!autostart::is_enabled()),
             ID_OPEN_CONFIG => config::open_in_editor(),
             ID_RESTART => restart(hwnd),
@@ -131,5 +155,6 @@ pub fn show_menu(hwnd: HWND) {
             }
             _ => {}
         }
+        None
     }
 }

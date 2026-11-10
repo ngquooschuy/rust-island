@@ -8,9 +8,17 @@ top = 10
 # Chiều rộng khi thu gọn (180–300) và khi mở rộng (320–700)
 collapsed_width = 220
 expanded_width = 400
+# Làm mờ nội dung desktop phía sau island (cần Windows 11):
+#   "none"    không làm mờ
+#   "blur"    kính mờ của Windows
+#   "acrylic" kính mờ thêm lớp hạt nhiễu, giống menu Start
+# Chỉ thấy khi nền trong suốt, ví dụ background = "#0F1112A0" ở mục [colors].
+# Tắt "Hiệu ứng trong suốt" trong Cài đặt Windows thì lớp kính thành màu đặc.
+backdrop = "none"
 
 [colors]
-# Dạng "#RRGGBB"
+# Dạng "#RRGGBB", hoặc "#RRGGBBAA" để trong suốt: AA từ 00 (trong suốt hẳn) tới FF (đục).
+# Nền trong suốt thì chữ và biểu tượng vẫn sắc nét, chỉ nền là nhìn xuyên qua được.
 background = "#0F1112"
 text = "#F5F5F7"
 secondary = "#8E8E93" # tên nghệ sĩ, ngày tháng, vạch ngăn
@@ -42,6 +50,9 @@ stay_while_playing = true # đang phát nhạc thì không thu nhỏ
 # Khi tra lời, tên bài, nghệ sĩ, album và thời lượng của bài đang phát được gửi tới LRCLIB.
 enabled = true # false: không gọi mạng, không hiện lời
 show = true    # hiện khung lời khi mở rộng trang nhạc (nút bên phải hàng nút để bật/tắt)
+# Hiện câu đang hát ngay trên island thu gọn; island giãn ngang cho vừa câu.
+# Bật/tắt nhanh: chuột phải lên island hoặc icon khay > "Hiện lời bài hát trên island thu gọn"
+collapsed = false
 # Bộ nhớ đệm trên đĩa (thư mục lyrics cạnh file này), mỗi bài một file nhỏ.
 # Đầy thì xóa bài lâu không nghe nhất trước; lời quá 90 ngày được tải lại.
 # 0 = tắt (không đọc/ghi đĩa); gợi ý 10, 25 hoặc 100 (MB).

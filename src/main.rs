@@ -4,6 +4,7 @@
 mod animation; // lò xo cho hiệu ứng co giãn
 mod app; // trạng thái island, xử lý sự kiện
 mod autostart; // khởi động cùng Windows
+mod backdrop; // nền Blur / Acrylic phía sau island
 mod battery; // trạng thái pin
 mod config; // đọc file cấu hình config.toml
 mod content; // nội dung hiển thị và các trang (Idle, Media)
@@ -34,6 +35,7 @@ use windows::{
 };
 
 use app::App;
+use backdrop::Backdrop;
 use config::Config;
 use graphics::Graphics;
 use layout::Layout;
@@ -57,6 +59,22 @@ fn with_app(f: impl FnOnce(&mut App)) {
             f(app);
         }
     });
+}
+
+/// Đọc một giá trị từ app (None nếu app chưa được tạo).
+/// Không giữ app trong lúc làm việc khác, vì menu chạy vòng lặp riêng và gọi lại wnd_proc
+fn read_app<R>(f: impl FnOnce(&App) -> R) -> Option<R> {
+    APP.with(|cell| cell.borrow().as_ref().map(f))
+}
+
+/// Hiện menu chuột phải (từ icon khay hoặc từ chính island)
+fn show_menu(hwnd: HWND) {
+    let collapsed = read_app(App::lyrics_collapsed).flatten();
+    if let Some(tray::Action::SetLyricsCollapsed(on)) = tray::show_menu(hwnd, collapsed) {
+        with_app(|app| app.set_lyrics_collapsed(hwnd, on));
+        // Ghi vào file cấu hình để lần sau mở lên vẫn giữ; lỗi thì chỉ mất lựa chọn này
+        let _ = config::save_lyrics_collapsed(on);
+    }
 }
 
 /// Tọa độ chuột (x, y) nằm trong 2 nửa thấp/cao của lparam, có thể âm
@@ -109,7 +127,14 @@ fn load_config() -> Config {
     })
 }
 
-fn create_window(layout: &Layout) -> Result<HWND> {
+/// Vị trí và kích thước (x, y, rộng, cao) của cửa sổ island trên màn hình
+fn window_rect(layout: &Layout) -> (i32, i32, i32, i32) {
+    (centered_x(layout), layout.top, layout.win_w, layout.win_h)
+}
+
+/// `owner`: cửa sổ kính mờ (nếu có). Cửa sổ được sở hữu luôn nằm trên cửa sổ sở hữu nó,
+/// nhờ vậy island luôn nằm ngay trên lớp kính
+fn create_window(layout: &Layout, owner: Option<HWND>) -> Result<HWND> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let class_name = w!("DynamicIslandWindow");
@@ -123,16 +148,17 @@ fn create_window(layout: &Layout) -> Result<HWND> {
         };
         RegisterClassExW(&wc);
 
+        let (x, y, w, h) = window_rect(layout);
         CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name,
             w!("Island"),
             WS_POPUP,
-            centered_x(layout),
-            layout.top,
-            layout.win_w,
-            layout.win_h,
-            None,
+            x,
+            y,
+            w,
+            h,
+            owner,
             None,
             Some(instance.into()),
             None,
@@ -177,11 +203,19 @@ fn main() -> Result<()> {
     }
     let config = load_config();
     let layout = Layout::new(&config.window);
-    let hwnd = create_window(&layout)?;
+    // Lớp kính mờ tạo trước, để cửa sổ island nhận nó làm cửa sổ sở hữu.
+    // Nền đục hẳn thì không nhìn thấy lớp kính, khỏi tạo cho tốn tài nguyên
+    let backdrop = config
+        .colors
+        .background
+        .is_translucent()
+        .then(|| Backdrop::create(config.window.backdrop, window_rect(&layout)))
+        .flatten();
+    let hwnd = create_window(&layout, backdrop.as_ref().map(Backdrop::hwnd))?;
 
     let (tx, rx) = mpsc::channel::<MediaCommand>();
     let graphics = Graphics::new(hwnd, layout, &config)?;
-    let app = App::new(graphics, layout, &config, tx);
+    let app = App::new(graphics, layout, backdrop, &config, tx);
     app.show_first_frame(hwnd)?;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
@@ -203,9 +237,7 @@ fn main() -> Result<()> {
         std::thread::spawn(move || weather::run(hwnd_raw, weather_config));
     }
 
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    }
+    with_app(|app| app.show(hwnd, true));
     run_message_loop(hwnd);
     Ok(())
 }
@@ -226,27 +258,29 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let delta = (wparam.0 >> 16) as u16 as i16;
             with_app(|app| app.on_wheel(hwnd, delta));
         }
-        WM_TIMER if wparam.0 == app::TIMER_LYRICS => with_app(|app| app.on_lyrics_tick()),
+        WM_TIMER if wparam.0 == app::TIMER_LYRICS => with_app(|app| app.on_lyrics_tick(hwnd)),
         WM_TIMER => {
             let fullscreen = is_fullscreen_app_running();
             with_app(|app| app.on_timer(hwnd, fullscreen));
         }
         WM_MEDIA_CHANGED => with_app(|app| app.on_media_changed(hwnd)),
-        WM_WEATHER_CHANGED => with_app(|app| app.on_weather_changed()),
+        WM_WEATHER_CHANGED => with_app(|app| app.on_weather_changed(hwnd)),
         WM_LYRICS_CHANGED => with_app(|app| app.on_lyrics_changed(hwnd)),
         // Màn hình đổi (cắm/rút, đổi độ phân giải): đặt lại vị trí
-        WM_DISPLAYCHANGE => with_app(|app| position_window(hwnd, app.layout())),
+        WM_DISPLAYCHANGE => with_app(|app| {
+            position_window(hwnd, app.layout());
+            if let Some(backdrop) = app.backdrop() {
+                position_window(backdrop.hwnd(), app.layout());
+            }
+        }),
         // Icon khay: chuột phải thì hiện menu
         WM_TRAY => {
             if (lparam.0 & 0xFFFF) as u32 == WM_RBUTTONUP {
-                tray::show_menu(hwnd);
+                show_menu(hwnd);
             }
         }
-        // Chỉ bản debug: chuột phải lên island để thoát nhanh khi đang phát triển
-        #[cfg(debug_assertions)]
-        WM_RBUTTONDOWN => unsafe {
-            let _ = DestroyWindow(hwnd);
-        },
+        // Chuột phải lên island: cùng menu với icon khay
+        WM_RBUTTONUP => show_menu(hwnd),
         WM_DESTROY => {
             tray::remove(hwnd);
             unsafe { PostQuitMessage(0) };

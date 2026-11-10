@@ -1,6 +1,7 @@
 //! Trạng thái của island và cách nó phản ứng với từng sự kiện.
 //! `wnd_proc` trong main.rs chỉ đọc thông điệp Windows rồi gọi các hàm `on_*` ở đây.
 
+use std::cell::Cell;
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 use windows::{
@@ -15,10 +16,11 @@ use windows::{
     core::Result,
 };
 
-use crate::animation::Spring;
+use crate::animation::{LineSlide, Spring};
+use crate::backdrop::Backdrop;
 use crate::config::{AutoHideConfig, ClockConfig, Config};
 use crate::content::{self, Content, Page};
-use crate::graphics::{Frame, Graphics};
+use crate::graphics::{CompactLyric, Frame, Graphics};
 use crate::layout::{BUTTON_COUNT, LYRICS_BUTTON, Layout};
 use crate::media::MediaCommand;
 
@@ -34,12 +36,17 @@ const LYRICS_TICK_MS: u32 = 150;
 pub struct App {
     graphics: Graphics,
     layout: Layout,
+    /// Lớp kính mờ phía sau island (None nếu tắt trong cấu hình)
+    backdrop: Option<Backdrop>,
     clock: ClockConfig,
     autohide: AutoHideConfig,
-    lyrics_enabled: bool, // bật lời bài hát trong cấu hình?
-    show_lyrics: bool,    // đang hiện lời? (nút bên phải hàng nút bật/tắt)
-    fast_timer: bool,     // TIMER_LYRICS đang chạy?
-    keep_tall: bool,      // vừa tắt lời khi đang rê chuột: giữ chiều cao tới lúc rời chuột
+    lyrics_enabled: bool,   // bật lời bài hát trong cấu hình?
+    show_lyrics: bool,      // đang hiện lời? (nút bên phải hàng nút bật/tắt)
+    lyrics_collapsed: bool, // hiện câu đang hát trên island thu gọn? (menu chuột phải)
+    slide: LineSlide,       // câu đang hiện trên island thu gọn, có hiệu ứng trượt
+    line_width: f32,        // island thu gọn rộng bao nhiêu để vừa câu đó
+    fast_timer: bool,       // TIMER_LYRICS đang chạy?
+    keep_tall: bool,        // vừa tắt lời khi đang rê chuột: giữ chiều cao tới lúc rời chuột
     width: Spring,
     height: Spring,
     content: Content,
@@ -49,8 +56,9 @@ pub struct App {
     notch: bool,          // đang tự ẩn thành notch? (không bao giờ đúng khi `hovered`)
     last_active: Instant, // lần cuối island được dùng, để đếm giờ tự ẩn
     hover_button: Option<usize>,
-    tracking: bool, // đã đăng ký nhận WM_MOUSELEAVE chưa?
-    hidden: bool,   // đang ẩn vì có ứng dụng toàn màn hình?
+    tracking: bool,                // đã đăng ký nhận WM_MOUSELEAVE chưa?
+    region: Cell<(i32, i32, i32)>, // vùng cửa sổ đang đặt (trái, phải, đáy), khỏi đặt lại
+    hidden: bool,                  // đang ẩn vì có ứng dụng toàn màn hình?
     last_frame: Instant,
     commands: Sender<MediaCommand>,
 }
@@ -59,6 +67,7 @@ impl App {
     pub fn new(
         graphics: Graphics,
         layout: Layout,
+        backdrop: Option<Backdrop>,
         config: &Config,
         commands: Sender<MediaCommand>,
     ) -> Self {
@@ -67,10 +76,14 @@ impl App {
         Self {
             graphics,
             layout,
+            backdrop,
             clock: config.clock,
             autohide: config.autohide,
             lyrics_enabled,
             show_lyrics: lyrics_enabled && config.lyrics.show,
+            lyrics_collapsed: lyrics_enabled && config.lyrics.collapsed,
+            slide: LineSlide::default(),
+            line_width: layout.collapsed.0,
             fast_timer: false,
             keep_tall: false,
             width: Spring::new(layout.collapsed.0),
@@ -83,6 +96,7 @@ impl App {
             last_active: Instant::now(),
             hover_button: None,
             tracking: false,
+            region: Cell::new((0, 0, 0)),
             hidden: false,
             last_frame: Instant::now(),
             commands,
@@ -91,6 +105,21 @@ impl App {
 
     pub fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    pub fn backdrop(&self) -> Option<&Backdrop> {
+        self.backdrop.as_ref()
+    }
+
+    /// Hiện/ẩn island cùng lớp kính mờ phía sau
+    pub fn show(&self, hwnd: HWND, visible: bool) {
+        if let Some(b) = &self.backdrop {
+            b.show(visible);
+        }
+        let cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
+        unsafe {
+            let _ = ShowWindow(hwnd, cmd);
+        }
     }
 
     fn fresh_content(&self) -> Content {
@@ -103,6 +132,10 @@ impl App {
         let left = self.layout.island_left(w).round() as i32;
         let right = (left + w.round() as i32).min(win_w);
         let bottom = (h.round() as i32).min(win_h);
+        // Hiệu ứng trượt chữ vẽ lại liên tục mà kích thước không đổi: khỏi đặt lại vùng
+        if self.region.replace((left, right, bottom)) == (left, right, bottom) {
+            return;
+        }
         unsafe {
             let region = CreateRectRgn(left.max(0), 0, right, bottom);
             let _ = SetWindowRgn(hwnd, Some(region), true);
@@ -116,6 +149,11 @@ impl App {
     }
 
     fn redraw(&self) -> Result<()> {
+        let (w, h) = (self.width.value, self.height.value);
+        if let Some(b) = &self.backdrop {
+            // Lớp kính đi theo hình island từng khung hình
+            b.set_shape(self.layout.island_left(w), w, h, Layout::corner_radius(h));
+        }
         self.graphics.render(&Frame {
             w: self.width.value,
             h: self.height.value,
@@ -123,6 +161,11 @@ impl App {
             page: self.page,
             hover_button: self.hover_button,
             lyrics_on: self.show_lyrics,
+            compact_lyric: self.slide.current.as_deref().map(|current| CompactLyric {
+                current,
+                previous: self.slide.previous.as_deref(),
+                progress: self.slide.progress(Instant::now()),
+            }),
         })
     }
 
@@ -133,14 +176,44 @@ impl App {
         }
     }
 
-    pub fn is_animating(&self) -> bool {
+    /// Island đang co giãn?
+    fn resizing(&self) -> bool {
         !(self.width.is_settled() && self.height.is_settled())
+    }
+
+    /// Đang có hiệu ứng (co giãn hoặc trượt chữ): vòng lặp chính vẽ liên tục
+    pub fn is_animating(&self) -> bool {
+        self.resizing() || self.slide.is_running(Instant::now())
+    }
+
+    /// Câu lời nên hiện trên island thu gọn lúc này (trang Media, đang phát, có lời đồng bộ)
+    fn collapsed_line(&self) -> Option<&str> {
+        let wanted = self.lyrics_collapsed && self.page == Page::Media && self.content.playing;
+        wanted.then(|| self.content.lyrics.current_line()).flatten()
+    }
+
+    /// Cập nhật câu trên island thu gọn: đổi câu thì trượt câu mới vào và giãn island cho vừa
+    fn refresh_line(&mut self, hwnd: HWND) {
+        let line = self.collapsed_line().map(str::to_owned);
+        if self.slide.set(line.as_deref(), Instant::now()) {
+            if let Some(line) = &line {
+                self.line_width = self.graphics.compact_width(line);
+            }
+            self.sync_target(hwnd);
+        }
+    }
+
+    /// Thay nội dung mới (mọi chỗ đổi nội dung đều đi qua đây để câu lời luôn khớp)
+    fn set_content(&mut self, hwnd: HWND, content: Content) {
+        self.content = content;
+        self.refresh_line(hwnd);
     }
 
     fn set_page(&mut self, hwnd: HWND, page: Page) {
         if page != self.page {
             self.page = page;
             self.hover_button = None; // nút media không còn trên trang mới
+            self.refresh_line(hwnd); // câu lời chỉ hiện ở trang Media
             self.sync_target(hwnd); // trang Media có lời thì cao hơn
             self.update_fast_timer(hwnd);
             self.redraw_if_idle();
@@ -166,6 +239,7 @@ impl App {
         self.notch = false;
         self.last_active = Instant::now();
         self.retarget(hwnd);
+        self.update_fast_timer(hwnd); // lời trên khung mở rộng và trên island thu gọn bật riêng
     }
 
     /// Kích thước island nên có theo trạng thái hiện tại
@@ -177,6 +251,9 @@ impl App {
             self.layout.expanded_size(panel)
         } else if self.notch {
             self.layout.notch
+        } else if self.slide.current.is_some() {
+            // Đang hiện câu lời: giãn ngang cho vừa câu
+            (self.line_width, self.layout.collapsed.1)
         } else {
             self.layout.collapsed
         }
@@ -233,8 +310,14 @@ impl App {
     }
 
     /// Đang hiện lời chạy theo nhạc (trang Media, đang phát, có lời đồng bộ)?
+    /// Mở rộng thì theo nút lời trên hàng nút, thu gọn thì theo tùy chọn trong menu
     fn lyrics_live(&self) -> bool {
-        self.show_lyrics
+        let shown = if self.hovered {
+            self.show_lyrics
+        } else {
+            self.lyrics_collapsed
+        };
+        shown
             && !self.hidden
             && !self.notch
             && self.page == Page::Media
@@ -267,13 +350,13 @@ impl App {
         self.width.update(dt);
         self.height.update(dt);
 
-        if !self.is_animating() {
+        if !self.resizing() {
             self.width.snap();
             self.height.snap();
             let (w, h) = self.hit_size();
             self.set_region(hwnd, w, h);
         }
-        self.content = self.fresh_content();
+        self.set_content(hwnd, self.fresh_content());
         self.redraw()
     }
 
@@ -359,17 +442,10 @@ impl App {
     pub fn on_timer(&mut self, hwnd: HWND, fullscreen: bool) {
         if fullscreen != self.hidden {
             self.hidden = fullscreen;
-            let cmd = if fullscreen {
-                SW_HIDE
-            } else {
-                SW_SHOWNOACTIVATE
-            };
-            unsafe {
-                let _ = ShowWindow(hwnd, cmd);
-            }
+            self.show(hwnd, !fullscreen);
             if !fullscreen {
-                self.content = self.fresh_content();
-                let _ = self.redraw();
+                self.set_content(hwnd, self.fresh_content());
+                self.redraw_if_idle();
             }
         }
         if self.hidden {
@@ -389,21 +465,33 @@ impl App {
             !new.same_when_collapsed(&self.content)
         };
         if changed {
-            self.content = new;
-            let _ = self.redraw();
+            self.set_content(hwnd, new);
+            self.redraw_if_idle();
         }
     }
 
     /// Timer nhanh: chỉ vẽ lại khi dòng lời đổi
-    pub fn on_lyrics_tick(&mut self) {
+    pub fn on_lyrics_tick(&mut self, hwnd: HWND) {
         if self.is_animating() || self.hidden || self.notch {
             return;
         }
         let new = self.fresh_content();
         if new.lyrics != self.content.lyrics {
-            self.content = new;
-            let _ = self.redraw();
+            self.set_content(hwnd, new); // đổi câu thì bắt đầu trượt, tick() vẽ tiếp
+            self.redraw_if_idle();
         }
+    }
+
+    /// Tùy chọn "lời bài hát trên island thu gọn"; None nếu đã tắt lời bài hát trong cấu hình
+    pub fn lyrics_collapsed(&self) -> Option<bool> {
+        self.lyrics_enabled.then_some(self.lyrics_collapsed)
+    }
+
+    pub fn set_lyrics_collapsed(&mut self, hwnd: HWND, on: bool) {
+        self.lyrics_collapsed = on && self.lyrics_enabled;
+        self.refresh_line(hwnd);
+        self.update_fast_timer(hwnd);
+        self.redraw_if_idle();
     }
 
     pub fn on_media_changed(&mut self, hwnd: HWND) {
@@ -416,6 +504,7 @@ impl App {
         if page != self.page {
             self.set_page(hwnd, page); // set_page tự vẽ lại
         } else {
+            self.refresh_line(hwnd);
             self.sync_target(hwnd); // hết bài thì khung lời biến mất
             self.update_fast_timer(hwnd);
             self.redraw_if_idle();
@@ -423,13 +512,13 @@ impl App {
     }
 
     pub fn on_lyrics_changed(&mut self, hwnd: HWND) {
-        self.content = self.fresh_content();
+        self.set_content(hwnd, self.fresh_content());
         self.update_fast_timer(hwnd);
         self.redraw_if_idle();
     }
 
-    pub fn on_weather_changed(&mut self) {
-        self.content = self.fresh_content();
+    pub fn on_weather_changed(&mut self, hwnd: HWND) {
+        self.set_content(hwnd, self.fresh_content());
         self.redraw_if_idle();
     }
 }

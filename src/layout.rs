@@ -77,6 +77,11 @@ impl Layout {
         (self.win_w as f32 - w) / 2.0
     }
 
+    /// Bán kính bo góc của island cao `h`: thấp thì tròn hẳn hai đầu như viên thuốc
+    pub fn corner_radius(h: f32) -> f32 {
+        (h / 2.0).min(36.0)
+    }
+
     /// Kích thước khi mở rộng; `lyrics_panel` = trang Media có khung lời bài hát
     pub fn expanded_size(&self, lyrics_panel: bool) -> (f32, f32) {
         if lyrics_panel {

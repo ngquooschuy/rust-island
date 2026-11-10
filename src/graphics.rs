@@ -20,7 +20,7 @@ use windows::{
 use windows_numerics::Vector2;
 
 use crate::battery::Battery;
-use crate::config::{Color, Config};
+use crate::config::{BackdropKind, Color, Config};
 use crate::content::{self, Content, LyricsView, Page, Progress};
 use crate::layout::{BUTTON_COUNT, LYRICS_BUTTON, Layout};
 use crate::weather::{Sky, Weather};
@@ -46,10 +46,29 @@ pub struct Frame<'a> {
     pub hover_button: Option<usize>,
     /// Người dùng đang bật hiện lời bài hát
     pub lyrics_on: bool,
+    /// Câu lời hiện trên island thu gọn (None: hiện tên bài như thường)
+    pub compact_lyric: Option<CompactLyric<'a>>,
 }
+
+/// Câu lời trên island thu gọn đang trượt vào
+pub struct CompactLyric<'a> {
+    pub current: &'a str,
+    /// Câu cũ đang trượt lên và mờ đi
+    pub previous: Option<&'a str>,
+    /// 0 = vừa đổi câu, 1 = đã trượt xong
+    pub progress: f32,
+}
+
+/// Câu lời trên island thu gọn: lề hai bên, và quãng trượt lúc đổi câu
+const COMPACT_PAD: f32 = 22.0;
+const SLIDE_DISTANCE: f32 = 16.0;
 
 /// Dòng lời trước/sau mờ hơn dòng đang hát
 const LYRIC_DIM: f32 = 0.55;
+
+/// Hạt nhiễu của nền Acrylic: ô vuông cạnh bao nhiêu điểm ảnh (lát lặp lại), và độ đậm
+const NOISE_SIZE: u32 = 128;
+const NOISE_OPACITY: f32 = 0.035;
 
 /// Chấm phân trang
 const DOT: f32 = 4.0;
@@ -61,6 +80,8 @@ pub struct Graphics {
     d2d_context: ID2D1DeviceContext,
     dwrite: IDWriteFactory,
     brush: ID2D1SolidColorBrush,
+    /// Lớp hạt nhiễu phủ lên nền khi dùng Acrylic (None với nền khác)
+    noise: Option<ID2D1BitmapBrush1>,
     fmt_small: IDWriteTextFormat,
     fmt_large: IDWriteTextFormat,
     fmt_title: IDWriteTextFormat,
@@ -106,6 +127,61 @@ fn make_format(
         // Không bao giờ xuống dòng: chữ dài quá thì tràn chứ không vỡ thành 2 dòng
         format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
         Ok(format)
+    }
+}
+
+/// Ô hạt nhiễu xám ngẫu nhiên (BGRA), lát lặp lại kín nền island như kính mờ Acrylic
+fn noise_pixels() -> Vec<u8> {
+    // Bộ sinh số giả ngẫu nhiên xorshift: đủ "lộn xộn" cho mắt, không cần crate rand
+    let mut state: u32 = 0x9E37_79B9;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let n = (NOISE_SIZE * NOISE_SIZE) as usize;
+    (0..n)
+        .flat_map(|_| {
+            let v = (next() >> 24) as u8;
+            [v, v, v, 0xFF]
+        })
+        .collect()
+}
+
+fn create_noise_brush(dc: &ID2D1DeviceContext) -> Result<ID2D1BitmapBrush1> {
+    let pixels = noise_pixels();
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+        colorContext: ManuallyDrop::new(None),
+    };
+    unsafe {
+        let bitmap = dc.CreateBitmap(
+            D2D_SIZE_U {
+                width: NOISE_SIZE,
+                height: NOISE_SIZE,
+            },
+            Some(pixels.as_ptr().cast()),
+            NOISE_SIZE * 4,
+            &props,
+        )?;
+        let brush = dc.CreateBitmapBrush(
+            &bitmap,
+            Some(&D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                extendModeX: D2D1_EXTEND_MODE_WRAP,
+                extendModeY: D2D1_EXTEND_MODE_WRAP,
+                interpolationMode: D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+            }),
+            None,
+        )?;
+        brush.SetOpacity(NOISE_OPACITY);
+        Ok(brush)
     }
 }
 
@@ -183,6 +259,12 @@ impl Graphics {
                 None,
             )?;
 
+            let noise = if config.window.backdrop == BackdropKind::Acrylic {
+                Some(create_noise_brush(&d2d_context)?)
+            } else {
+                None
+            };
+
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let family = HSTRING::from(config.font.family.as_str());
             let fmt_small = make_format(&dwrite, &family, 16.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
@@ -207,6 +289,7 @@ impl Graphics {
                 d2d_context,
                 dwrite,
                 brush,
+                noise,
                 fmt_small,
                 fmt_large,
                 fmt_title,
@@ -231,12 +314,28 @@ impl Graphics {
 
     // ---------- Các hàm vẽ cơ bản ----------
 
+    /// Đặt màu cọ; độ đục của màu (#RRGGBBAA) nhân với `opacity`
     fn set_brush(&self, color: Color, opacity: f32) {
-        let (r, g, b) = color.to_f32();
+        let (r, g, b, a) = color.to_f32();
         unsafe {
-            self.brush.SetColor(&D2D1_COLOR_F { r, g, b, a: 1.0 });
+            self.brush.SetColor(&D2D1_COLOR_F { r, g, b, a });
             self.brush.SetOpacity(opacity);
         }
+    }
+
+    /// Vẽ "lỗ khoét" bằng màu nền: ghi đè thẳng điểm ảnh thay vì phủ lên, để khi nền
+    /// trong suốt thì chỗ khoét trông y như nền island (phủ lên thì sẽ thấy hình bên dưới)
+    fn knockout(&self, draw: impl FnOnce()) {
+        self.set_brush(self.background, 1.0);
+        unsafe {
+            self.d2d_context
+                .SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY)
+        };
+        draw();
+        unsafe {
+            self.d2d_context
+                .SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER)
+        };
     }
 
     fn fill(&self, shape: D2D1_ROUNDED_RECT) {
@@ -312,6 +411,16 @@ impl Graphics {
         (cut(lo), f)
     }
 
+    /// Island thu gọn cần rộng bao nhiêu để vừa câu lời `line`
+    /// (không hẹp hơn lúc thu gọn thường, không rộng hơn lúc mở rộng)
+    pub fn compact_width(&self, line: &str) -> f32 {
+        let (collapsed, expanded) = (self.layout.collapsed.0, self.layout.expanded.0);
+        let (text, format) = self.fit_text(line, &[&self.fmt_small], expanded - 2.0 * COMPACT_PAD);
+        (self.text_width(&text, format) + 2.0 * COMPACT_PAD)
+            .ceil()
+            .clamp(collapsed, expanded)
+    }
+
     // ---------- Khung hình ----------
 
     /// Vẽ một khung hình
@@ -360,9 +469,12 @@ impl Graphics {
             ..
         } = *frame;
         let left = self.layout.island_left(w);
-        let pill = rounded(rect(left, 0.0, left + w, h), (h / 2.0).min(36.0));
+        let pill = rounded(rect(left, 0.0, left + w, h), Layout::corner_radius(h));
         self.set_brush(self.background, 1.0);
         self.fill(pill);
+        if let Some(noise) = &self.noise {
+            unsafe { self.d2d_context.FillRoundedRectangle(&pill, noise) };
+        }
         // Viền sáng rất mảnh cho island tách khỏi nền tối
         let inset = rounded(
             rect(left + 0.5, 0.5, left + w - 0.5, h - 0.5),
@@ -371,9 +483,10 @@ impl Graphics {
         self.set_brush(self.text, 0.08);
         self.stroke(inset, 1.0);
 
-        // t: 0 = thu gọn hẳn, 1 = mở rộng hẳn. Chữ nhỏ mờ dần ở nửa đầu, chữ lớn hiện dần ở nửa sau
-        let (collapsed, expanded) = (self.layout.collapsed.0, self.layout.expanded.0);
-        let t = ((w - collapsed) / (expanded - collapsed)).clamp(0.0, 1.0);
+        // t: 0 = thu gọn hẳn, 1 = mở rộng hẳn. Chữ nhỏ mờ dần ở nửa đầu, chữ lớn hiện dần ở nửa sau.
+        // Tính theo chiều cao: chiều rộng khi thu gọn thay đổi theo câu lời đang hiện
+        let (collapsed, expanded) = (self.layout.collapsed.1, self.layout.expanded.1);
+        let t = ((h - collapsed) / (expanded - collapsed)).clamp(0.0, 1.0);
         let alpha_big = (2.0 * t - 1.0).clamp(0.0, 1.0);
 
         // Notch Auto-Hide: `shown` 0 = notch, 1 = thu gọn bình thường.
@@ -503,8 +616,7 @@ impl Graphics {
         self.circle(cx, cy, r);
         if !is_day {
             // Khoét một hình tròn màu nền lệch lên trên-phải để thành trăng khuyết
-            self.set_brush(self.background, 1.0);
-            self.circle(cx + 0.45 * r, cy - 0.35 * r, 0.85 * r);
+            self.knockout(|| self.circle(cx + 0.45 * r, cy - 0.35 * r, 0.85 * r));
         }
     }
 
@@ -725,21 +837,15 @@ impl Graphics {
 
     // ---------- Trang Media ----------
 
-    /// Thu gọn: dòng lời đang hát (nếu có), không thì "♪ Tên bài"
+    /// Thu gọn: câu lời đang hát (nếu bật trong menu), không thì "♪ Tên bài"
     fn draw_media_compact(&self, frame: &Frame, left: f32, alpha: f32) {
         let (content, w, h) = (frame.content, frame.w, frame.h);
         let area = rect(left + 14.0, 2.0, left + w - 14.0, h - 12.0);
-        let live_line = content
-            .lyrics
-            .current_line()
-            .filter(|_| frame.lyrics_on && content.playing);
         if content.title.is_empty() {
             self.set_brush(self.secondary, alpha);
             self.draw_text("Không có nhạc", &self.fmt_small, area);
-        } else if let Some(line) = live_line {
-            let (text, format) = self.fit_text(line, &[&self.fmt_small], w - 28.0);
-            self.set_brush(self.text, alpha);
-            self.draw_text(&text, format, area);
+        } else if let Some(lyric) = &frame.compact_lyric {
+            self.draw_compact_lyric(lyric, left + w / 2.0, h, alpha);
         } else {
             // Tạm dừng thì chữ nhạt đi
             let color = if content.playing {
@@ -750,6 +856,24 @@ impl Graphics {
             self.set_brush(color, alpha);
             self.draw_text(&content.song, &self.fmt_small, area);
         }
+    }
+
+    /// Câu lời căn giữa tại `mid`: câu cũ trượt lên và mờ đi, câu mới trượt từ dưới lên.
+    /// Phần chữ lòi ra ngoài island (lúc island đang giãn theo câu mới) bị khung cắt đi
+    fn draw_compact_lyric(&self, lyric: &CompactLyric, mid: f32, h: f32, alpha: f32) {
+        let max_w = self.layout.expanded.0 - 2.0 * COMPACT_PAD;
+        // Khung chữ rộng hẳn ra hai bên: chữ luôn căn giữa island, không bị cắt sớm
+        let line = |text: &str, dy: f32, opacity: f32| {
+            let (text, format) = self.fit_text(text, &[&self.fmt_small], max_w);
+            self.set_brush(self.text, alpha * opacity);
+            let r = rect(mid - max_w, 2.0 + dy, mid + max_w, h - 12.0 + dy);
+            self.draw_text(&text, format, r);
+        };
+        let p = lyric.progress;
+        if let Some(previous) = lyric.previous.filter(|_| p < 1.0) {
+            line(previous, -SLIDE_DISTANCE * p, 1.0 - p);
+        }
+        line(lyric.current, SLIDE_DISTANCE * (1.0 - p), p);
     }
 
     fn draw_media_full(&self, frame: &Frame, alpha: f32) {
@@ -814,9 +938,10 @@ impl Graphics {
         self.fill(rounded(rect(cx - 9.0, cy - 7.5, cx + 9.0, cy + 5.0), 3.5));
         self.line((cx - 4.5, cy + 4.0), (cx - 7.0, cy + 8.5), 3.0); // đuôi bong bóng
         // Hai dòng chữ khoét bằng màu nền
-        self.set_brush(self.background, alpha);
-        self.fill(rounded(rect(cx - 5.5, cy - 4.0, cx + 5.5, cy - 2.6), 0.7));
-        self.fill(rounded(rect(cx - 5.5, cy - 0.6, cx + 2.5, cy + 0.8), 0.7));
+        self.knockout(|| {
+            self.fill(rounded(rect(cx - 5.5, cy - 4.0, cx + 5.5, cy - 2.6), 0.7));
+            self.fill(rounded(rect(cx - 5.5, cy - 0.6, cx + 2.5, cy + 0.8), 0.7));
+        });
     }
 
     /// Trang Media có khung lời: tiêu đề · nghệ sĩ, 3 dòng lời, thanh tiến độ, hàng nút
