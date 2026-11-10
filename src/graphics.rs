@@ -21,8 +21,8 @@ use windows_numerics::Vector2;
 
 use crate::battery::Battery;
 use crate::config::{Color, Config};
-use crate::content::{Content, Page};
-use crate::layout::Layout;
+use crate::content::{self, Content, LyricsView, Page, Progress};
+use crate::layout::{BUTTON_COUNT, LYRICS_BUTTON, Layout};
 use crate::weather::{Sky, Weather};
 
 /// Màu cố định cho trạng thái pin (theo màu hệ thống của Apple)
@@ -35,6 +35,21 @@ const BATTERY_NUB_W: f32 = 2.6;
 
 /// Kích thước khung biểu tượng thời tiết ở tỉ lệ 1.0
 const WEATHER_ICON: (f32, f32) = (27.0, 20.0);
+
+/// Mọi thứ cần để vẽ một khung hình (gom lại cho gọn tham số)
+pub struct Frame<'a> {
+    /// Kích thước island lúc này (đang co giãn thì là giá trị trung gian)
+    pub w: f32,
+    pub h: f32,
+    pub content: &'a Content,
+    pub page: Page,
+    pub hover_button: Option<usize>,
+    /// Người dùng đang bật hiện lời bài hát
+    pub lyrics_on: bool,
+}
+
+/// Dòng lời trước/sau mờ hơn dòng đang hát
+const LYRIC_DIM: f32 = 0.55;
 
 /// Chấm phân trang
 const DOT: f32 = 4.0;
@@ -51,6 +66,9 @@ pub struct Graphics {
     fmt_title: IDWriteTextFormat,
     fmt_date: IDWriteTextFormat,
     fmt_icon: IDWriteTextFormat,
+    fmt_lyric: IDWriteTextFormat,
+    fmt_head: IDWriteTextFormat,
+    fmt_tiny: IDWriteTextFormat,
     layout: Layout,
     background: Color,
     text: Color,
@@ -58,6 +76,8 @@ pub struct Graphics {
     accent: Color,
     /// Ô bên phải của Idle View hiện thời tiết (true) hay pin (false)
     weather_enabled: bool,
+    /// Có nút bật/tắt lời bài hát trên hàng nút không
+    lyrics_enabled: bool,
     // Không dùng trực tiếp nhưng phải giữ sống, nếu không hình sẽ biến mất
     _dcomp_device: IDCompositionDevice,
     _dcomp_target: IDCompositionTarget,
@@ -171,6 +191,9 @@ impl Graphics {
             let fmt_date = make_format(&dwrite, &family, 14.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             // Icon ⏮ ▶ ⏭ luôn dùng Segoe UI cho chắc có đủ ký tự
             let fmt_icon = make_format(&dwrite, h!("Segoe UI"), 18.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let fmt_lyric = make_format(&dwrite, &family, 20.0, DWRITE_FONT_WEIGHT_BOLD)?;
+            let fmt_head = make_format(&dwrite, &family, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+            let fmt_tiny = make_format(&dwrite, &family, 11.0, DWRITE_FONT_WEIGHT_NORMAL)?;
 
             let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
             let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, true)?;
@@ -189,12 +212,16 @@ impl Graphics {
                 fmt_title,
                 fmt_date,
                 fmt_icon,
+                fmt_lyric,
+                fmt_head,
+                fmt_tiny,
                 layout,
                 background: config.colors.background,
                 text: config.colors.text,
                 secondary: config.colors.secondary,
                 accent: config.colors.accent,
                 weather_enabled: config.weather.enabled,
+                lyrics_enabled: config.lyrics.enabled,
                 _dcomp_device: dcomp_device,
                 _dcomp_target: dcomp_target,
                 _dcomp_visual: dcomp_visual,
@@ -253,17 +280,42 @@ impl Graphics {
         }
     }
 
+    /// Chọn cỡ chữ đầu tiên trong `formats` vừa `max_w`; không cỡ nào vừa thì
+    /// dùng cỡ cuối cùng và cắt bớt thêm "…" (tìm nhị phân độ dài vừa nhất)
+    fn fit_text<'f>(
+        &self,
+        text: &str,
+        formats: &[&'f IDWriteTextFormat],
+        max_w: f32,
+    ) -> (String, &'f IDWriteTextFormat) {
+        for &f in formats {
+            if self.text_width(text, f) <= max_w {
+                return (text.to_string(), f);
+            }
+        }
+        let f = formats[formats.len() - 1];
+        let chars: Vec<char> = text.chars().collect();
+        let cut = |n: usize| {
+            let head: String = chars[..n].iter().collect();
+            format!("{}…", head.trim_end())
+        };
+        // `lo` luôn là độ dài vừa (0 ký tự + "…" coi như vừa)
+        let (mut lo, mut hi) = (0, chars.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if self.text_width(&cut(mid), f) <= max_w {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        (cut(lo), f)
+    }
+
     // ---------- Khung hình ----------
 
-    /// Vẽ một khung hình: island rộng `w`, cao `h`, đang ở trang `page`
-    pub fn render(
-        &self,
-        w: f32,
-        h: f32,
-        content: &Content,
-        page: Page,
-        hover_button: Option<usize>,
-    ) -> Result<()> {
+    /// Vẽ một khung hình
+    pub fn render(&self, frame: &Frame) -> Result<()> {
         unsafe {
             let surface: IDXGISurface = self.swap_chain.GetBuffer(0)?;
             let props = D2D1_BITMAP_PROPERTIES1 {
@@ -288,7 +340,7 @@ impl Graphics {
                 b: 0.0,
                 a: 0.0,
             }));
-            self.draw_island(w, h, content, page, hover_button);
+            self.draw_island(frame);
             self.d2d_context.EndDraw(None, None)?;
             self.d2d_context.SetTarget(None);
 
@@ -297,15 +349,16 @@ impl Graphics {
         }
     }
 
-    // Thân viên thuốc, nội dung của trang hiện tại, rồi chấm phân trang
-    fn draw_island(
-        &self,
-        w: f32,
-        h: f32,
-        content: &Content,
-        page: Page,
-        hover_button: Option<usize>,
-    ) {
+    // Thân viên thuốc, nội dung của trang hiện tại, rồi chấm phân trang.
+    // Khi là notch thì chỉ còn thân viên thuốc
+    fn draw_island(&self, frame: &Frame) {
+        let Frame {
+            w,
+            h,
+            content,
+            page,
+            ..
+        } = *frame;
         let left = self.layout.island_left(w);
         let pill = rounded(rect(left, 0.0, left + w, h), (h / 2.0).min(36.0));
         self.set_brush(self.background, 1.0);
@@ -321,26 +374,40 @@ impl Graphics {
         // t: 0 = thu gọn hẳn, 1 = mở rộng hẳn. Chữ nhỏ mờ dần ở nửa đầu, chữ lớn hiện dần ở nửa sau
         let (collapsed, expanded) = (self.layout.collapsed.0, self.layout.expanded.0);
         let t = ((w - collapsed) / (expanded - collapsed)).clamp(0.0, 1.0);
-        let alpha_small = (1.0 - 2.0 * t).clamp(0.0, 1.0);
         let alpha_big = (2.0 * t - 1.0).clamp(0.0, 1.0);
 
+        // Notch Auto-Hide: `shown` 0 = notch, 1 = thu gọn bình thường.
+        // Nội dung mờ dần và biến mất hẳn ở nửa đường, lúc viên thuốc còn đủ chỗ chứa
+        let (notch_h, collapsed_h) = (self.layout.notch.1, self.layout.collapsed.1);
+        let shown = ((h - notch_h) / (collapsed_h - notch_h)).clamp(0.0, 1.0);
+        let reveal = (2.0 * shown - 1.0).clamp(0.0, 1.0);
+        let alpha_small = (1.0 - 2.0 * t).clamp(0.0, 1.0) * reveal;
+
+        // Cắt theo khung viên thuốc để chữ không lòi ra ngoài lúc đang co giãn
+        unsafe {
+            self.d2d_context
+                .PushAxisAlignedClip(&pill.rect, D2D1_ANTIALIAS_MODE_ALIASED)
+        };
         if alpha_small > 0.0 {
             match page {
                 Page::Idle => self.draw_idle_compact(content, left, w, h, alpha_small),
-                Page::Media => self.draw_media_compact(content, left, w, h, alpha_small),
+                Page::Media => self.draw_media_compact(frame, left, alpha_small),
             }
         }
         if alpha_big > 0.0 {
             match page {
                 Page::Idle => self.draw_idle_full(content, alpha_big),
-                Page::Media => self.draw_media_full(content, alpha_big, hover_button),
+                Page::Media => self.draw_media_full(frame, alpha_big),
             }
         }
-        self.draw_dots(page, h);
+        unsafe { self.d2d_context.PopAxisAlignedClip() };
+        if reveal > 0.0 {
+            self.draw_dots(page, h, reveal);
+        }
     }
 
     /// Hàng chấm phân trang: chấm của trang hiện tại kéo dài thành viên thuốc nhỏ
-    fn draw_dots(&self, page: Page, h: f32) {
+    fn draw_dots(&self, page: Page, h: f32, alpha: f32) {
         let (cx, cy) = self.layout.dots_center(h);
         let n = Page::ALL.len() as f32;
         let total = DOT_ACTIVE_W + (n - 1.0) * (DOT + DOT_GAP);
@@ -351,7 +418,7 @@ impl Graphics {
             } else {
                 (DOT, self.secondary, 0.45)
             };
-            self.set_brush(color, opacity);
+            self.set_brush(color, opacity * alpha);
             self.fill(rounded(
                 rect(x, cy - DOT / 2.0, x + width, cy + DOT / 2.0),
                 DOT / 2.0,
@@ -658,11 +725,21 @@ impl Graphics {
 
     // ---------- Trang Media ----------
 
-    fn draw_media_compact(&self, content: &Content, left: f32, w: f32, h: f32, alpha: f32) {
+    /// Thu gọn: dòng lời đang hát (nếu có), không thì "♪ Tên bài"
+    fn draw_media_compact(&self, frame: &Frame, left: f32, alpha: f32) {
+        let (content, w, h) = (frame.content, frame.w, frame.h);
         let area = rect(left + 14.0, 2.0, left + w - 14.0, h - 12.0);
+        let live_line = content
+            .lyrics
+            .current_line()
+            .filter(|_| frame.lyrics_on && content.playing);
         if content.title.is_empty() {
             self.set_brush(self.secondary, alpha);
             self.draw_text("Không có nhạc", &self.fmt_small, area);
+        } else if let Some(line) = live_line {
+            let (text, format) = self.fit_text(line, &[&self.fmt_small], w - 28.0);
+            self.set_brush(self.text, alpha);
+            self.draw_text(&text, format, area);
         } else {
             // Tạm dừng thì chữ nhạt đi
             let color = if content.playing {
@@ -675,8 +752,17 @@ impl Graphics {
         }
     }
 
-    fn draw_media_full(&self, content: &Content, alpha: f32, hover_button: Option<usize>) {
+    fn draw_media_full(&self, frame: &Frame, alpha: f32) {
+        let content = frame.content;
         let (el, right) = self.expanded_edges();
+        // Khung cao (có lời) khi đang bật lời, hoặc khi island vẫn đang cao (vừa tắt lời)
+        let tall = frame.h > self.layout.expanded.1 + 0.5;
+        if content.shows_lyrics_panel(frame.page, frame.lyrics_on)
+            || (tall && content.shows_lyrics_panel(frame.page, true))
+        {
+            self.draw_media_lyrics(frame, alpha);
+            return;
+        }
         if content.title.is_empty() {
             self.set_brush(self.secondary, alpha);
             self.draw_text(
@@ -690,16 +776,143 @@ impl Graphics {
         self.draw_text(&content.title, &self.fmt_title, rect(el, 10.0, right, 46.0));
         self.set_brush(self.secondary, alpha);
         self.draw_text(&content.artist, &self.fmt_date, rect(el, 44.0, right, 68.0));
+        self.draw_controls(frame, alpha);
+    }
 
+    /// Hàng nút ở đáy island: lùi, phát/dừng, tới, và nút bật/tắt lời bên phải
+    fn draw_controls(&self, frame: &Frame, alpha: f32) {
+        let content = frame.content;
         let glyphs = ["⏮", if content.playing { "⏸" } else { "▶" }, "⏭"];
-        for (i, glyph) in glyphs.iter().enumerate() {
-            let r = self.layout.button_rect(i);
-            if hover_button == Some(i) {
+        let hover_bg = |i: usize, r: D2D_RECT_F| {
+            if frame.hover_button == Some(i) {
                 self.set_brush(self.text, alpha * 0.18);
                 self.fill(rounded(r, 10.0));
             }
+        };
+        for (i, glyph) in glyphs.iter().enumerate().take(BUTTON_COUNT) {
+            let r = self.layout.button_rect(i, frame.h);
+            hover_bg(i, r);
             self.set_brush(self.text, alpha);
             self.draw_text(glyph, &self.fmt_icon, r);
         }
+        if self.lyrics_enabled {
+            let r = self.layout.button_rect(LYRICS_BUTTON, frame.h);
+            hover_bg(LYRICS_BUTTON, r);
+            self.draw_lyrics_icon(r, frame.lyrics_on, alpha);
+        }
+    }
+
+    /// Biểu tượng bong bóng lời thoại: màu nhấn khi đang bật lời, xám khi tắt
+    fn draw_lyrics_icon(&self, r: D2D_RECT_F, on: bool, alpha: f32) {
+        let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        let (color, opacity) = if on {
+            (self.accent, 1.0)
+        } else {
+            (self.secondary, 0.7)
+        };
+        self.set_brush(color, alpha * opacity);
+        self.fill(rounded(rect(cx - 9.0, cy - 7.5, cx + 9.0, cy + 5.0), 3.5));
+        self.line((cx - 4.5, cy + 4.0), (cx - 7.0, cy + 8.5), 3.0); // đuôi bong bóng
+        // Hai dòng chữ khoét bằng màu nền
+        self.set_brush(self.background, alpha);
+        self.fill(rounded(rect(cx - 5.5, cy - 4.0, cx + 5.5, cy - 2.6), 0.7));
+        self.fill(rounded(rect(cx - 5.5, cy - 0.6, cx + 2.5, cy + 0.8), 0.7));
+    }
+
+    /// Trang Media có khung lời: tiêu đề · nghệ sĩ, 3 dòng lời, thanh tiến độ, hàng nút
+    fn draw_media_lyrics(&self, frame: &Frame, alpha: f32) {
+        let content = frame.content;
+        let (el, right) = self.expanded_edges();
+        self.draw_header(content, (el, right), alpha);
+
+        let max_w = right - el - 40.0;
+        let off = LyricsView::Message("Lời bài hát đang tắt");
+        let lyrics = if frame.lyrics_on {
+            &content.lyrics
+        } else {
+            &off
+        };
+        match lyrics {
+            LyricsView::Lines {
+                prev,
+                current,
+                next,
+            } => {
+                let dim_line = |text: &Option<String>, top: f32, bottom: f32| {
+                    if let Some(text) = text {
+                        let (t, f) = self.fit_text(text, &[&self.fmt_date], max_w);
+                        self.set_brush(self.secondary, alpha * LYRIC_DIM);
+                        self.draw_text(&t, f, rect(el, top, right, bottom));
+                    }
+                };
+                dim_line(prev, 38.0, 58.0);
+                // Dòng đang hát: chữ đậm 20px, dài quá thì xuống 16px rồi mới cắt bớt
+                let (t, f) = self.fit_text(current, &[&self.fmt_lyric, &self.fmt_small], max_w);
+                self.set_brush(self.text, alpha);
+                self.draw_text(&t, f, rect(el, 58.0, right, 90.0));
+                dim_line(next, 90.0, 110.0);
+            }
+            LyricsView::Message(message) => {
+                self.set_brush(self.secondary, alpha);
+                self.draw_text(message, &self.fmt_date, rect(el, 38.0, right, 110.0));
+            }
+            LyricsView::Off => {}
+        }
+
+        if let Some(progress) = content.progress {
+            self.draw_progress(progress, (el, right), frame.h - 66.0, alpha);
+        }
+        self.draw_controls(frame, alpha);
+    }
+
+    /// "Tên bài · Nghệ sĩ" căn giữa, tên bài trắng, nghệ sĩ xám; chật thì cắt nghệ sĩ trước
+    fn draw_header(&self, content: &Content, (el, right): (f32, f32), alpha: f32) {
+        let max_w = right - el - 48.0;
+        let (title, title_f) = self.fit_text(&content.title, &[&self.fmt_head], max_w);
+        let title_w = self.text_width(&title, title_f) + 1.0;
+        let room = max_w - title_w;
+        let artist = (!content.artist.is_empty() && room > 50.0).then(|| {
+            let (a, _) =
+                self.fit_text(&format!("  ·  {}", content.artist), &[&self.fmt_date], room);
+            let w = self.text_width(&a, &self.fmt_date) + 1.0;
+            (a, w)
+        });
+        let artist_w = artist.as_ref().map_or(0.0, |(_, w)| *w);
+        let start = (el + right) / 2.0 - (title_w + artist_w) / 2.0;
+        let (top, bottom) = (10.0, 34.0);
+        self.set_brush(self.text, alpha);
+        self.draw_text(&title, title_f, rect(start, top, start + title_w, bottom));
+        if let Some((a, w)) = artist {
+            self.set_brush(self.secondary, alpha);
+            let x = start + title_w;
+            self.draw_text(&a, &self.fmt_date, rect(x, top, x + w, bottom));
+        }
+    }
+
+    /// "0:29 ━━━●──────── -1:56" tại tâm dọc `cy`
+    fn draw_progress(&self, p: Progress, (el, right): (f32, f32), cy: f32, alpha: f32) {
+        let (top, bottom) = (cy - 8.0, cy + 8.0);
+        self.set_brush(self.secondary, alpha);
+        let remaining = p.duration_ms.saturating_sub(p.elapsed_ms);
+        self.draw_text(
+            &content::mmss(p.elapsed_ms),
+            &self.fmt_tiny,
+            rect(el + 14.0, top, el + 58.0, bottom),
+        );
+        self.draw_text(
+            &format!("-{}", content::mmss(remaining)),
+            &self.fmt_tiny,
+            rect(right - 58.0, top, right - 14.0, bottom),
+        );
+
+        let (x0, x1) = (el + 64.0, right - 64.0);
+        let x = x0 + (x1 - x0) * p.fraction();
+        let bar = |from: f32, to: f32| rounded(rect(from, cy - 2.0, to, cy + 2.0), 2.0);
+        self.set_brush(self.secondary, alpha * 0.3);
+        self.fill(bar(x0, x1));
+        self.set_brush(self.accent, alpha);
+        self.fill(bar(x0, x.max(x0 + 4.0)));
+        self.set_brush(self.text, alpha);
+        self.circle(x, cy, 5.0);
     }
 }

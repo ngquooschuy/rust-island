@@ -8,6 +8,12 @@ use crate::config::WindowConfig;
 // Chiều cao cố định: vị trí chữ và nút trong graphics.rs được căn theo hai số này
 const COLLAPSED_H: f32 = 44.0;
 const EXPANDED_H: f32 = 116.0;
+/// Trang Media khi mở rộng có khung lời bài hát: cao hơn để chứa 3 dòng lời và thanh tiến độ
+const LYRICS_H: f32 = 200.0;
+/// Island khi tự ẩn: chỉ còn một vạch nhỏ (notch)
+const NOTCH: (f32, f32) = (72.0, 8.0);
+/// Vùng nhận chuột quanh notch rộng hơn hình vẽ (mỗi bên, và phía dưới) để dễ rê trúng
+const NOTCH_HIT_PAD: (f32, f32) = (16.0, 8.0);
 // Cửa sổ trong suốt rộng/cao hơn island mở rộng một chút
 const MARGIN_X: f32 = 60.0;
 const MARGIN_Y: f32 = 30.0;
@@ -24,7 +30,12 @@ const DOTS_HIT_HALF_W: f32 = 24.0;
 const DOTS_HIT_H: f32 = 16.0;
 /// Khoảng cách giữa tâm hai nút liền nhau
 const BTN_GAP: f32 = 64.0;
+/// Ba nút điều khiển nhạc: lùi, phát/dừng, tới
 pub const BUTTON_COUNT: usize = 3;
+/// Nút thứ tư (bật/tắt lời bài hát) nằm sát mép phải của island
+pub const LYRICS_BUTTON: usize = 3;
+const LYRICS_BTN_W: f32 = 36.0;
+const LYRICS_BTN_FROM_RIGHT: f32 = 16.0;
 
 /// `Copy` vì chỉ chứa vài con số: truyền đi đâu cũng sao chép, không cần mượn
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37,17 +48,28 @@ pub struct Layout {
     /// (rộng, cao) của island khi thu gọn và khi mở rộng
     pub collapsed: (f32, f32),
     pub expanded: (f32, f32),
+    /// (rộng, cao) khi tự ẩn thành notch
+    pub notch: (f32, f32),
 }
 
 impl Layout {
     pub fn new(window: &WindowConfig) -> Self {
         Self {
             win_w: (window.expanded_width + MARGIN_X).ceil() as i32,
-            win_h: (EXPANDED_H + MARGIN_Y) as i32,
+            win_h: (EXPANDED_H.max(LYRICS_H) + MARGIN_Y) as i32,
             top: window.top,
             collapsed: (window.collapsed_width, COLLAPSED_H),
             expanded: (window.expanded_width, EXPANDED_H),
+            notch: NOTCH,
         }
+    }
+
+    /// (rộng, cao) của vùng nhận chuột khi island là notch
+    pub fn notch_hit(&self) -> (f32, f32) {
+        (
+            self.notch.0 + 2.0 * NOTCH_HIT_PAD.0,
+            self.notch.1 + NOTCH_HIT_PAD.1,
+        )
     }
 
     /// Mép trái của island rộng `w` khi căn giữa cửa sổ
@@ -55,22 +77,40 @@ impl Layout {
         (self.win_w as f32 - w) / 2.0
     }
 
-    /// Hình chữ nhật của nút thứ `i` (0 = lùi, 1 = phát/dừng, 2 = tới)
-    pub fn button_rect(&self, i: usize) -> D2D_RECT_F {
-        let cx = self.win_w as f32 / 2.0 + (i as f32 - 1.0) * BTN_GAP;
-        let top = self.expanded.1 - BTN_FROM_BOTTOM;
+    /// Kích thước khi mở rộng; `lyrics_panel` = trang Media có khung lời bài hát
+    pub fn expanded_size(&self, lyrics_panel: bool) -> (f32, f32) {
+        if lyrics_panel {
+            (self.expanded.0, LYRICS_H)
+        } else {
+            self.expanded
+        }
+    }
+
+    /// Hình chữ nhật của nút thứ `i` trên island cao `h` (hàng nút neo ở đáy).
+    /// 0 = lùi, 1 = phát/dừng, 2 = tới, `LYRICS_BUTTON` = bật/tắt lời
+    pub fn button_rect(&self, i: usize, h: f32) -> D2D_RECT_F {
+        let top = h - BTN_FROM_BOTTOM;
+        let (cx, w) = if i == LYRICS_BUTTON {
+            let right = self.island_left(self.expanded.0) + self.expanded.0;
+            (
+                right - LYRICS_BTN_FROM_RIGHT - LYRICS_BTN_W / 2.0,
+                LYRICS_BTN_W,
+            )
+        } else {
+            (self.win_w as f32 / 2.0 + (i as f32 - 1.0) * BTN_GAP, BTN_W)
+        };
         D2D_RECT_F {
-            left: cx - BTN_W / 2.0,
+            left: cx - w / 2.0,
             top,
-            right: cx + BTN_W / 2.0,
+            right: cx + w / 2.0,
             bottom: top + BTN_H,
         }
     }
 
-    /// Nút nằm dưới điểm (x, y), nếu có
-    pub fn button_at(&self, x: f32, y: f32) -> Option<usize> {
-        (0..BUTTON_COUNT).find(|&i| {
-            let r = self.button_rect(i);
+    /// Nút nằm dưới điểm (x, y) trên island cao `h`, xét `count` nút đầu tiên
+    pub fn button_at(&self, x: f32, y: f32, h: f32, count: usize) -> Option<usize> {
+        (0..count).find(|&i| {
+            let r = self.button_rect(i, h);
             x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
         })
     }
@@ -108,15 +148,31 @@ mod tests {
     #[test]
     fn default_config_window_size() {
         let l = layout();
-        assert_eq!((l.win_w, l.win_h), (460, 146));
-        assert_eq!(l.button_rect(1).top, 70.0);
+        assert_eq!((l.win_w, l.win_h), (460, 230));
+        assert_eq!(l.button_rect(1, 116.0).top, 70.0);
+        assert_eq!(l.expanded_size(false), (400.0, 116.0));
+        assert_eq!(l.expanded_size(true), (400.0, 200.0));
+    }
+
+    #[test]
+    fn notch_is_smaller_than_the_narrowest_island() {
+        let l = Layout::new(&WindowConfig {
+            collapsed_width: 180.0, // nhỏ nhất mà cấu hình cho phép
+            ..WindowConfig::default()
+        });
+        let (hit_w, hit_h) = l.notch_hit();
+        assert!(l.notch.0 < hit_w && hit_w < l.collapsed.0);
+        assert!(l.notch.1 < hit_h && hit_h < l.collapsed.1);
     }
 
     #[test]
     fn dots_sit_below_buttons() {
         let l = layout();
-        let (_, dots_y) = l.dots_center(l.expanded.1);
-        assert!(dots_y - 3.0 > l.button_rect(1).bottom, "chấm đè lên nút");
+        for lyrics in [false, true] {
+            let (_, h) = l.expanded_size(lyrics);
+            let (_, dots_y) = l.dots_center(h);
+            assert!(dots_y - 3.0 > l.button_rect(1, h).bottom, "chấm đè lên nút");
+        }
     }
 
     #[test]
@@ -141,19 +197,23 @@ mod tests {
     #[test]
     fn button_at_finds_each_button_at_its_center() {
         let l = layout();
-        for i in 0..BUTTON_COUNT {
-            let (x, y) = center(l.button_rect(i));
-            assert_eq!(l.button_at(x, y), Some(i));
+        for i in 0..=LYRICS_BUTTON {
+            let (x, y) = center(l.button_rect(i, 116.0));
+            assert_eq!(l.button_at(x, y, 116.0, LYRICS_BUTTON + 1), Some(i));
         }
     }
 
     #[test]
     fn button_at_returns_none_between_and_outside_buttons() {
         let l = layout();
-        let (x0, y) = center(l.button_rect(0));
-        let (x1, _) = center(l.button_rect(1));
-        assert_eq!(l.button_at((x0 + x1) / 2.0, y), None); // khe giữa hai nút
-        assert_eq!(l.button_at(x1, 0.0), None); // phía trên hàng nút
+        let h = 116.0;
+        let (x0, y) = center(l.button_rect(0, h));
+        let (x1, _) = center(l.button_rect(1, h));
+        assert_eq!(l.button_at((x0 + x1) / 2.0, y, h, 3), None); // khe giữa hai nút
+        assert_eq!(l.button_at(x1, 0.0, h, 3), None); // phía trên hàng nút
+        // Tắt lời bài hát thì nút thứ tư không bấm được
+        let (xl, yl) = center(l.button_rect(LYRICS_BUTTON, h));
+        assert_eq!(l.button_at(xl, yl, h, 3), None);
     }
 
     #[test]
@@ -164,11 +224,16 @@ mod tests {
                 expanded_width: width,
                 ..WindowConfig::default()
             });
-            let (w, h) = l.expanded;
-            for i in 0..BUTTON_COUNT {
-                let r = l.button_rect(i);
-                assert!(l.island_contains(w, h, r.left, r.top));
-                assert!(l.island_contains(w, h, r.right, r.bottom));
+            for lyrics in [false, true] {
+                let (w, h) = l.expanded_size(lyrics);
+                for i in 0..=LYRICS_BUTTON {
+                    let r = l.button_rect(i, h);
+                    assert!(l.island_contains(w, h, r.left, r.top));
+                    assert!(l.island_contains(w, h, r.right, r.bottom));
+                }
+                // Nút lời không đè lên nút "tới"
+                let next = l.button_rect(2, h);
+                assert!(l.button_rect(LYRICS_BUTTON, h).left > next.right);
             }
         }
     }

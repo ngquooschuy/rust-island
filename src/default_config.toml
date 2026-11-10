@@ -29,3 +29,20 @@ show_seconds = true # hiện giây khi mở rộng
 enabled = true      # false: không dùng mạng, bên phải hiện pin thay cho thời tiết
 city = "Hà Nội"     # tên thành phố, tiếng Việt hay tiếng Anh đều được
 fahrenheit = false  # true: hiện °F
+
+[autohide]
+# Notch Auto-Hide: thu nhỏ island thành một vạch nhỏ khi không dùng.
+# Rê chuột vào vạch đó để hiện lại; đổi bài hát cũng tự hiện lại.
+enabled = true
+delay_seconds = 5         # số giây không dùng trước khi thu nhỏ (1–3600)
+stay_while_playing = true # đang phát nhạc thì không thu nhỏ
+
+[lyrics]
+# Lời bài hát chạy theo nhạc, lấy từ lrclib.net (miễn phí, mã nguồn mở).
+# Khi tra lời, tên bài, nghệ sĩ, album và thời lượng của bài đang phát được gửi tới LRCLIB.
+enabled = true # false: không gọi mạng, không hiện lời
+show = true    # hiện khung lời khi mở rộng trang nhạc (nút bên phải hàng nút để bật/tắt)
+# Bộ nhớ đệm trên đĩa (thư mục lyrics cạnh file này), mỗi bài một file nhỏ.
+# Đầy thì xóa bài lâu không nghe nhất trước; lời quá 90 ngày được tải lại.
+# 0 = tắt (không đọc/ghi đĩa); gợi ý 10, 25 hoặc 100 (MB).
+cache_mb = 25

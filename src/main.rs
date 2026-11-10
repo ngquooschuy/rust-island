@@ -8,7 +8,9 @@ mod battery; // trạng thái pin
 mod config; // đọc file cấu hình config.toml
 mod content; // nội dung hiển thị và các trang (Idle, Media)
 mod graphics; // vẽ bằng Direct2D + DirectComposition
+mod http; // HTTP GET bằng WinHTTP (thời tiết, lời bài hát)
 mod layout; // kích thước, vị trí nút
+mod lyrics; // lời bài hát chạy theo nhạc (LRCLIB + cache trên đĩa)
 mod media; // luồng nền đọc/điều khiển media
 mod tray; // icon khay hệ thống
 mod weather; // luồng nền tải thời tiết từ Open-Meteo
@@ -35,6 +37,7 @@ use app::App;
 use config::Config;
 use graphics::Graphics;
 use layout::Layout;
+use lyrics::WM_LYRICS_CHANGED;
 use media::{MediaCommand, WM_MEDIA_CHANGED};
 use tray::WM_TRAY;
 use weather::WM_WEATHER_CHANGED;
@@ -178,18 +181,23 @@ fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel::<MediaCommand>();
     let graphics = Graphics::new(hwnd, layout, &config)?;
-    let app = App::new(graphics, layout, config.clock, tx);
+    let app = App::new(graphics, layout, &config, tx);
     app.show_first_frame(hwnd)?;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
     tray::add(hwnd)?;
     unsafe {
-        SetTimer(Some(hwnd), 1, 1000, None);
+        SetTimer(Some(hwnd), app::TIMER_CLOCK, 1000, None);
     }
 
     // HWND chứa con trỏ nên không gửi qua luồng được: đổi sang số trước
     let hwnd_raw = hwnd.0 as isize;
-    std::thread::spawn(move || media::run(hwnd_raw, rx));
+    // Lời bài hát: luồng riêng, luồng media báo cho nó mỗi khi đổi bài
+    let lyrics = config
+        .lyrics
+        .enabled
+        .then(|| lyrics::start(hwnd_raw, config.lyrics.cache_mb));
+    std::thread::spawn(move || media::run(hwnd_raw, rx, lyrics));
     if config.weather.enabled {
         let weather_config = config.weather.clone();
         std::thread::spawn(move || weather::run(hwnd_raw, weather_config));
@@ -211,19 +219,21 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_MOUSELEAVE => with_app(|app| app.on_mouse_leave(hwnd)),
         WM_LBUTTONDOWN => {
             let (x, y) = mouse_pos(lparam);
-            with_app(|app| app.on_click(x, y));
+            with_app(|app| app.on_click(hwnd, x, y));
         }
         // Con lăn: nửa cao của wparam là độ lăn (có dấu, ±120 mỗi nấc)
         WM_MOUSEWHEEL => {
             let delta = (wparam.0 >> 16) as u16 as i16;
-            with_app(|app| app.on_wheel(delta));
+            with_app(|app| app.on_wheel(hwnd, delta));
         }
+        WM_TIMER if wparam.0 == app::TIMER_LYRICS => with_app(|app| app.on_lyrics_tick()),
         WM_TIMER => {
             let fullscreen = is_fullscreen_app_running();
             with_app(|app| app.on_timer(hwnd, fullscreen));
         }
-        WM_MEDIA_CHANGED => with_app(|app| app.on_media_changed()),
+        WM_MEDIA_CHANGED => with_app(|app| app.on_media_changed(hwnd)),
         WM_WEATHER_CHANGED => with_app(|app| app.on_weather_changed()),
+        WM_LYRICS_CHANGED => with_app(|app| app.on_lyrics_changed(hwnd)),
         // Màn hình đổi (cắm/rút, đổi độ phân giải): đặt lại vị trí
         WM_DISPLAYCHANGE => with_app(|app| position_window(hwnd, app.layout())),
         // Icon khay: chuột phải thì hiện menu

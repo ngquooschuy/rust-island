@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -23,6 +24,8 @@ pub struct Config {
     pub font: FontConfig,
     pub clock: ClockConfig,
     pub weather: WeatherConfig,
+    pub autohide: AutoHideConfig,
+    pub lyrics: LyricsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -113,6 +116,61 @@ impl Default for WeatherConfig {
     }
 }
 
+/// Lời bài hát chạy theo nhạc, lấy từ LRCLIB
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LyricsConfig {
+    /// false: không gọi mạng, không hiện lời
+    pub enabled: bool,
+    /// Hiện khung lời khi mở rộng trang nhạc (nút bên phải bật/tắt được trong lúc dùng)
+    pub show: bool,
+    /// Giới hạn bộ nhớ đệm trên đĩa (MB); 0 = tắt, không đọc/ghi đĩa
+    pub cache_mb: u32,
+}
+
+impl Default for LyricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show: true,
+            cache_mb: 25,
+        }
+    }
+}
+
+/// Notch Auto-Hide: thu nhỏ island thành một vạch nhỏ khi không dùng
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoHideConfig {
+    pub enabled: bool,
+    /// Số giây không dùng trước khi thu nhỏ
+    pub delay_seconds: u32,
+    /// Đang phát nhạc thì không thu nhỏ
+    pub stay_while_playing: bool,
+}
+
+impl Default for AutoHideConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delay_seconds: 5,
+            stay_while_playing: true,
+        }
+    }
+}
+
+impl AutoHideConfig {
+    /// Island có đang được dùng không? Đang dùng thì chưa đếm giờ tự ẩn
+    pub fn in_use(&self, hovered: bool, playing: bool) -> bool {
+        hovered || (self.stay_while_playing && playing)
+    }
+
+    /// Đã không dùng đủ lâu (`idle`) để thu nhỏ chưa?
+    pub fn is_due(&self, idle: Duration) -> bool {
+        self.enabled && idle >= Duration::from_secs(u64::from(self.delay_seconds))
+    }
+}
+
 /// Màu RGB, trong file TOML viết dạng chuỗi "#RRGGBB".
 /// `try_from = "String"`: serde đọc ra String trước, rồi đổi sang Color bằng `TryFrom`
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -183,6 +241,8 @@ impl Config {
         // Dưới 180 thì đồng hồ và pin ở Idle View không đủ chỗ
         w.collapsed_width = clamp_or(w.collapsed_width, 180.0, 300.0, d.collapsed_width);
         w.expanded_width = clamp_or(w.expanded_width, 320.0, 700.0, d.expanded_width);
+        self.autohide.delay_seconds = self.autohide.delay_seconds.clamp(1, 3600);
+        self.lyrics.cache_mb = self.lyrics.cache_mb.min(1000);
         self
     }
 }
@@ -293,6 +353,51 @@ mod tests {
         assert_eq!(c.window.top, 0);
         assert_eq!(c.window.collapsed_width, 300.0);
         assert_eq!(c.window.expanded_width, 400.0);
+    }
+
+    #[test]
+    fn autohide_delay_is_clamped() {
+        let c = Config::parse(
+            "[autohide]
+delay_seconds = 0",
+        )
+        .unwrap();
+        assert_eq!(c.autohide.delay_seconds, 1);
+        assert!(c.autohide.enabled);
+    }
+
+    #[test]
+    fn autohide_waits_for_the_delay() {
+        let a = AutoHideConfig::default(); // 5 giây
+        assert!(!a.is_due(Duration::from_secs(4)));
+        assert!(a.is_due(Duration::from_secs(5)));
+        let off = AutoHideConfig {
+            enabled: false,
+            ..a
+        };
+        assert!(!off.is_due(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn hover_and_playback_count_as_in_use() {
+        let a = AutoHideConfig::default();
+        assert!(a.in_use(true, false));
+        assert!(a.in_use(false, true));
+        assert!(!a.in_use(false, false));
+        let hide_anyway = AutoHideConfig {
+            stay_while_playing: false,
+            ..a
+        };
+        assert!(!hide_anyway.in_use(false, true));
+    }
+
+    #[test]
+    fn lyrics_cache_can_be_turned_off_and_is_capped() {
+        let off = Config::parse("[lyrics]\ncache_mb = 0").unwrap();
+        assert_eq!(off.lyrics.cache_mb, 0);
+        assert!(off.lyrics.enabled);
+        let huge = Config::parse("[lyrics]\ncache_mb = 99999").unwrap();
+        assert_eq!(huge.lyrics.cache_mb, 1000);
     }
 
     #[test]

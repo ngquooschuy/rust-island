@@ -11,10 +11,10 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::{PCWSTR, Result, w},
+    core::{HSTRING, PCWSTR, Result, w},
 };
 
-use crate::{autostart, config};
+use crate::{autostart, config, lyrics};
 
 /// Thông điệp Windows gửi về cửa sổ khi có sự kiện chuột trên icon khay
 pub const WM_TRAY: u32 = WM_APP + 2;
@@ -24,6 +24,7 @@ const ID_AUTOSTART: usize = 1;
 const ID_EXIT: usize = 2;
 const ID_OPEN_CONFIG: usize = 3;
 const ID_RESTART: usize = 4;
+const ID_CLEAR_LYRICS: usize = 5;
 
 /// Mở một bản mới của chương trình rồi đóng bản hiện tại,
 /// để bản mới đọc lại file cấu hình
@@ -85,6 +86,22 @@ pub fn show_menu(hwnd: HWND) {
         );
         let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, w!("Mở file cấu hình"));
         let _ = AppendMenuW(menu, MF_STRING, ID_RESTART, w!("Khởi động lại để áp dụng"));
+        // Bộ nhớ đệm lời bài hát: hiện số bài và dung lượng; trống hoặc đang tắt thì làm mờ
+        let (label, flags) = match lyrics::cache_summary() {
+            Some((count, summary)) => {
+                let flags = if count == 0 {
+                    MF_STRING | MF_GRAYED
+                } else {
+                    MF_STRING
+                };
+                (format!("Xóa bộ nhớ đệm lời bài hát ({summary})"), flags)
+            }
+            None => (
+                "Bộ nhớ đệm lời bài hát: đang tắt".to_string(),
+                MF_STRING | MF_GRAYED,
+            ),
+        };
+        let _ = AppendMenuW(menu, flags, ID_CLEAR_LYRICS, &HSTRING::from(label));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Thoát"));
 
@@ -108,6 +125,7 @@ pub fn show_menu(hwnd: HWND) {
             ID_AUTOSTART => autostart::set(!autostart::is_enabled()),
             ID_OPEN_CONFIG => config::open_in_editor(),
             ID_RESTART => restart(hwnd),
+            ID_CLEAR_LYRICS => lyrics::clear_cache(),
             ID_EXIT => {
                 let _ = DestroyWindow(hwnd);
             }

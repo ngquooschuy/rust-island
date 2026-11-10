@@ -1,10 +1,11 @@
-//! Nội dung hiển thị trên island (đồng hồ, ngày, thời tiết, pin, bài đang phát)
+//! Nội dung hiển thị trên island (đồng hồ, ngày, thời tiết, pin, bài đang phát, lời bài hát)
 //! và các trang mà người dùng lướt qua bằng con lăn chuột.
 
 use windows::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocalTime};
 
 use crate::battery::{self, Battery};
 use crate::config::ClockConfig;
+use crate::lyrics::{self, Status};
 use crate::media::{self, MediaInfo};
 use crate::weather::{self, Weather};
 
@@ -36,6 +37,58 @@ pub struct Content {
     pub battery: Option<Battery>,
     /// None khi chưa tải được hoặc đã tắt trong cấu hình
     pub weather: Option<Weather>,
+    /// Thanh tiến độ; None nếu trình phát không báo thời lượng
+    pub progress: Option<Progress>,
+    pub lyrics: LyricsView,
+}
+
+/// Vị trí phát hiện tại và thời lượng bài (mili giây)
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Progress {
+    pub elapsed_ms: u64,
+    pub duration_ms: u64,
+}
+
+impl Progress {
+    /// Tỉ lệ đã phát, từ 0 đến 1
+    pub fn fraction(&self) -> f32 {
+        if self.duration_ms == 0 {
+            0.0
+        } else {
+            (self.elapsed_ms as f32 / self.duration_ms as f32).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Phần lời bài hát cần vẽ
+#[derive(Clone, PartialEq, Debug)]
+pub enum LyricsView {
+    /// Tắt trong cấu hình, hoặc không có bài nào
+    Off,
+    /// Chưa có lời để hiện: "Đang tìm…", "Không tìm thấy…"
+    Message(&'static str),
+    /// Dòng trước, dòng đang hát, dòng sau
+    Lines {
+        prev: Option<String>,
+        current: String,
+        next: Option<String>,
+    },
+}
+
+impl LyricsView {
+    /// Dòng đang hát, nếu đang có lời chạy theo nhạc
+    pub fn current_line(&self) -> Option<&str> {
+        match self {
+            Self::Lines { current, .. } => Some(current),
+            _ => None,
+        }
+    }
+}
+
+/// "2:05" cho thanh tiến độ
+pub fn mmss(ms: u64) -> String {
+    let s = ms / 1000;
+    format!("{}:{:02}", s / 60, s % 60)
 }
 
 impl Content {
@@ -48,6 +101,17 @@ impl Content {
             && self.playing == other.playing
             && self.battery == other.battery
             && self.weather == other.weather
+            && self.lyrics.current_line() == other.lyrics.current_line()
+    }
+
+    /// Trang Media khi mở rộng có hiện khung lời bài hát (island cao hơn) không?
+    pub fn shows_lyrics_panel(&self, page: Page, lyrics_on: bool) -> bool {
+        page == Page::Media && lyrics_on && !self.title.is_empty()
+    }
+
+    /// So với `old`: vừa bắt đầu phát, hoặc vừa đổi sang bài khác?
+    pub fn started_playback_since(&self, old: &Self) -> bool {
+        self.playing && !self.title.is_empty() && (!old.playing || self.title != old.title)
     }
 
     /// Dòng phụ khi mở rộng trang Idle:
@@ -110,9 +174,7 @@ impl Page {
     /// Tự chuyển trang khi media đổi: bắt đầu phát/đổi bài thì sang Media,
     /// hết bài thì về Idle, còn lại giữ trang người dùng đang chọn
     pub fn after_media_change(self, old: &Content, new: &Content) -> Self {
-        let started = new.playing && !new.title.is_empty() && !old.playing;
-        let new_song = new.playing && new.title != old.title;
-        if started || new_song {
+        if new.started_playback_since(old) {
             Self::Media
         } else if new.title.is_empty() && !old.title.is_empty() {
             Self::Idle
@@ -133,12 +195,56 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Nội dung theo giờ hệ thống, pin và bài đang phát ngay lúc này
-pub fn current(clock: &ClockConfig) -> Content {
+pub fn current(clock: &ClockConfig, lyrics_enabled: bool) -> Content {
     let now = unsafe { GetLocalTime() };
+    let media = media::snapshot();
+    let position_ms = media::position_at(&media, media::now_ticks());
+    let status = lyrics::status_for(&media.title, &media.artist);
     Content {
         weather: weather::snapshot(),
-        ..build(&now, &media::snapshot(), battery::status(), clock)
+        progress: progress(&media, position_ms),
+        lyrics: lyrics_view(lyrics_enabled, &media, status, position_ms),
+        ..build(&now, &media, battery::status(), clock)
     }
+}
+
+fn progress(media: &MediaInfo, position_ms: u64) -> Option<Progress> {
+    (media.duration_ms > 0 && !media.title.is_empty()).then_some(Progress {
+        elapsed_ms: position_ms,
+        duration_ms: media.duration_ms,
+    })
+}
+
+/// Chọn lời để hiện cho bài đang phát tại `position_ms`
+fn lyrics_view(
+    enabled: bool,
+    media: &MediaInfo,
+    status: Option<Status>,
+    position_ms: u64,
+) -> LyricsView {
+    if !enabled || media.title.is_empty() {
+        return LyricsView::Off;
+    }
+    let message = match status {
+        None | Some(Status::Loading) => "Đang tìm lời bài hát…",
+        Some(Status::PlainOnly) => "Bài này chưa có lời chạy theo nhạc",
+        Some(Status::Instrumental) => "♪ Nhạc không lời",
+        Some(Status::NotFound) => "Không tìm thấy lời bài hát",
+        Some(Status::Failed) => "Không tải được lời bài hát",
+        // Có lời đồng bộ nhưng trình phát không báo vị trí thì không biết hát tới đâu
+        Some(Status::Synced(_)) if media.duration_ms == 0 && media.updated_ticks == 0 => {
+            "Trình phát nhạc không báo vị trí bài hát"
+        }
+        Some(Status::Synced(lyrics)) => {
+            let w = lyrics.window_at(position_ms);
+            return LyricsView::Lines {
+                prev: w.prev.map(String::from),
+                current: w.current.to_string(),
+                next: w.next.map(String::from),
+            };
+        }
+    };
+    LyricsView::Message(message)
 }
 
 /// "09:05" / "09:05:07" (24 giờ) hoặc "9:05 SA" / "9:05:07 CH" (12 giờ)
@@ -183,7 +289,10 @@ fn build(
         artist: truncate(&media.artist, 30),
         playing: media.playing,
         battery,
-        weather: None, // current() điền vào sau
+        // current() điền vào sau
+        weather: None,
+        progress: None,
+        lyrics: LyricsView::Off,
     }
 }
 
@@ -209,6 +318,7 @@ mod tests {
             title: "Nơi này có anh".into(),
             artist: "Sơn Tùng M-TP".into(),
             playing,
+            ..MediaInfo::default()
         }
     }
 
@@ -246,6 +356,85 @@ mod tests {
 
     fn with_song(playing: bool) -> Content {
         build(&time(), &song(playing), None, &H24)
+    }
+
+    fn synced(lrc: &str) -> Option<Status> {
+        let parsed = std::sync::Arc::new(crate::lyrics::parse_lrc(lrc));
+        Some(Status::Synced(parsed))
+    }
+
+    fn timed_song() -> MediaInfo {
+        MediaInfo {
+            duration_ms: 146_000,
+            updated_ticks: 1,
+            ..song(true)
+        }
+    }
+
+    #[test]
+    fn lyrics_view_shows_three_lines_around_position() {
+        let status = synced("[00:01.00] one\n[00:05.00] two\n[00:09.00] three");
+        let view = lyrics_view(true, &timed_song(), status, 6_000);
+        assert_eq!(
+            view,
+            LyricsView::Lines {
+                prev: Some("one".into()),
+                current: "two".into(),
+                next: Some("three".into()),
+            }
+        );
+        assert_eq!(view.current_line(), Some("two"));
+    }
+
+    #[test]
+    fn lyrics_view_messages() {
+        let media = timed_song();
+        assert_eq!(lyrics_view(false, &media, None, 0), LyricsView::Off);
+        assert_eq!(
+            lyrics_view(true, &media, None, 0),
+            LyricsView::Message("Đang tìm lời bài hát…")
+        );
+        assert_eq!(
+            lyrics_view(true, &media, Some(Status::NotFound), 0),
+            LyricsView::Message("Không tìm thấy lời bài hát")
+        );
+        // Có lời nhưng trình phát không báo vị trí
+        let no_timeline = song(true);
+        assert_eq!(
+            lyrics_view(true, &no_timeline, synced("[00:01.00] x"), 0),
+            LyricsView::Message("Trình phát nhạc không báo vị trí bài hát")
+        );
+        assert_eq!(
+            lyrics_view(true, &MediaInfo::default(), None, 0),
+            LyricsView::Off
+        );
+    }
+
+    #[test]
+    fn progress_needs_a_duration() {
+        assert_eq!(progress(&song(true), 5_000), None);
+        let p = progress(&timed_song(), 73_000).unwrap();
+        assert_eq!(p.fraction(), 0.5);
+        assert_eq!(
+            (mmss(p.elapsed_ms), mmss(p.duration_ms - p.elapsed_ms)),
+            ("1:13".into(), "1:13".into())
+        );
+    }
+
+    #[test]
+    fn mmss_formats_minutes_and_seconds() {
+        assert_eq!(mmss(0), "0:00");
+        assert_eq!(mmss(29_900), "0:29");
+        assert_eq!(mmss(605_000), "10:05");
+    }
+
+    #[test]
+    fn lyrics_panel_only_on_media_page_with_a_song() {
+        let c = with_song(true);
+        assert!(c.shows_lyrics_panel(Page::Media, true));
+        assert!(!c.shows_lyrics_panel(Page::Media, false));
+        assert!(!c.shows_lyrics_panel(Page::Idle, true));
+        assert!(!idle().shows_lyrics_panel(Page::Media, true));
     }
 
     #[test]
@@ -335,6 +524,15 @@ mod tests {
     fn page_switches_to_media_when_playback_starts() {
         let page = Page::Idle.after_media_change(&with_song(false), &with_song(true));
         assert_eq!(page, Page::Media);
+    }
+
+    #[test]
+    fn started_playback_means_play_or_new_song() {
+        let playing = with_song(true);
+        assert!(playing.started_playback_since(&idle())); // có bài mới
+        assert!(playing.started_playback_since(&with_song(false))); // bấm phát lại
+        assert!(!playing.started_playback_since(&playing)); // vẫn bài cũ
+        assert!(!with_song(false).started_playback_since(&playing)); // tạm dừng
     }
 
     #[test]

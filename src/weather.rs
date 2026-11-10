@@ -2,21 +2,17 @@
 //! Chạy trên luồng nền riêng: tìm tọa độ theo tên thành phố một lần,
 //! rồi cứ 15 phút tải lại; báo cho cửa sổ bằng `WM_WEATHER_CHANGED`.
 
-use std::ffi::c_void;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Deserialize;
-use windows::{
-    Win32::{
-        Foundation::{HWND, LPARAM, WPARAM},
-        Networking::WinHttp::*,
-        UI::WindowsAndMessaging::{PostMessageW, WM_APP},
-    },
-    core::{HSTRING, PCWSTR, w},
+use windows::Win32::{
+    Foundation::{HWND, LPARAM, WPARAM},
+    UI::WindowsAndMessaging::{PostMessageW, WM_APP},
 };
 
 use crate::config::WeatherConfig;
+use crate::http::{Session, percent_encode};
 
 /// Luồng thời tiết gửi thông điệp này về cửa sổ khi có số liệu mới
 pub const WM_WEATHER_CHANGED: u32 = WM_APP + 3;
@@ -95,18 +91,6 @@ pub fn snapshot() -> Option<Weather> {
 
 // ---------- Địa chỉ API và đọc JSON (thuần, có test) ----------
 
-/// Mã hóa chuỗi để đặt vào URL: "Hà Nội" → "H%C3%A0%20N%E1%BB%99i"
-fn percent_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
 fn geocode_url(city: &str) -> String {
     format!(
         "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=vi&format=json",
@@ -168,134 +152,24 @@ fn parse_weather(json: &str, place: &Place) -> Result<Weather, String> {
     })
 }
 
-// ---------- Mạng (dùng WinHTTP có sẵn trong Windows) ----------
-// Không dùng HttpClient của WinRT: với ứng dụng desktop không đóng gói nó báo
-// lỗi chứng chỉ 0x80072F8F, trong khi WinHTTP dùng chung tầng TLS với cả hệ thống.
-
-/// Handle của WinHTTP, tự đóng khi ra khỏi phạm vi (RAII, giống `File` của Rust)
-struct Handle(*mut c_void);
-
-impl Handle {
-    /// WinHTTP trả về con trỏ null khi lỗi; lý do nằm ở GetLastError
-    fn new(raw: *mut c_void) -> Result<Self, String> {
-        if raw.is_null() {
-            Err(windows::core::Error::from_thread().to_string())
-        } else {
-            Ok(Self(raw))
-        }
-    }
-}
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = WinHttpCloseHandle(self.0);
-        }
-    }
-}
-
-fn open_session() -> Result<Handle, String> {
-    let session = Handle::new(unsafe {
-        WinHttpOpen(
-            w!("DynamicIsland/0.1"),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, // tự dùng proxy của hệ thống nếu có
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        )
-    })?;
-    // Phân giải tên, kết nối, gửi, nhận (mili giây)
-    unsafe {
-        let _ = WinHttpSetTimeouts(session.0, 10_000, 10_000, 10_000, 15_000);
-    }
-    Ok(session)
-}
-
-/// "https://host/path?query" → ("host", "/path?query")
-fn split_url(url: &str) -> Option<(&str, &str)> {
-    let rest = url.strip_prefix("https://")?;
-    let slash = rest.find('/')?;
-    Some(rest.split_at(slash))
-}
-
-fn http_get(session: &Handle, url: &str) -> Result<String, String> {
-    let (host, path) = split_url(url).ok_or("URL không hợp lệ")?;
-    let err = |e: windows::core::Error| e.to_string();
-    unsafe {
-        // Thứ tự khai báo quan trọng: Rust drop ngược lại, nên request đóng trước connect
-        let connect = Handle::new(WinHttpConnect(
-            session.0,
-            &HSTRING::from(host),
-            INTERNET_DEFAULT_HTTPS_PORT,
-            0,
-        ))?;
-        let request = Handle::new(WinHttpOpenRequest(
-            connect.0,
-            w!("GET"),
-            &HSTRING::from(path),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            std::ptr::null(),
-            WINHTTP_FLAG_SECURE,
-        ))?;
-        WinHttpSendRequest(request.0, None, None, 0, 0, 0).map_err(err)?;
-        WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(err)?;
-
-        let mut status = 0u32;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        WinHttpQueryHeaders(
-            request.0,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            PCWSTR::null(),
-            Some((&raw mut status).cast()),
-            &mut size,
-            std::ptr::null_mut(),
-        )
-        .map_err(err)?;
-        if status != 200 {
-            return Err(format!("máy chủ trả về HTTP {status}"));
-        }
-
-        // Đọc thân phản hồi từng khúc cho tới khi hết
-        let mut body = Vec::new();
-        loop {
-            let mut available = 0u32;
-            WinHttpQueryDataAvailable(request.0, &mut available).map_err(err)?;
-            if available == 0 {
-                break;
-            }
-            let start = body.len();
-            body.resize(start + available as usize, 0u8);
-            let mut read = 0u32;
-            WinHttpReadData(
-                request.0,
-                body[start..].as_mut_ptr().cast(),
-                available,
-                &mut read,
-            )
-            .map_err(err)?;
-            body.truncate(start + read as usize);
-        }
-        String::from_utf8(body).map_err(|e| e.to_string())
-    }
-}
-
 /// Một lần cập nhật; nhớ tọa độ vào `place` để lần sau khỏi tìm lại
 fn update(
-    session: &Handle,
+    session: &Session,
     config: &WeatherConfig,
     place: &mut Option<Place>,
 ) -> Result<Weather, String> {
     let found = match place {
         Some(p) => p.clone(),
         None => {
-            let p = parse_place(&http_get(session, &geocode_url(&config.city))?)?;
+            let p = parse_place(&session.get(&geocode_url(&config.city))?.ok()?)?;
             *place = Some(p.clone());
             p
         }
     };
     parse_weather(
-        &http_get(session, &forecast_url(&found, config.fahrenheit))?,
+        &session
+            .get(&forecast_url(&found, config.fahrenheit))?
+            .ok()?,
         &found,
     )
 }
@@ -320,10 +194,10 @@ fn fake() -> Option<Weather> {
 
 /// Vòng lặp của luồng thời tiết
 pub fn run(hwnd_raw: isize, config: WeatherConfig) {
-    let Ok(session) = open_session() else {
+    let Ok(session) = Session::open() else {
         return;
     };
-    let hwnd = HWND(hwnd_raw as *mut c_void);
+    let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
 
     let mut place = None;
     loop {
@@ -360,27 +234,11 @@ mod tests {
     #[test]
     #[ignore]
     fn live_fetch_from_open_meteo() {
-        let session = open_session().unwrap();
+        let session = Session::open().unwrap();
         let mut place = None;
         let w = update(&session, &WeatherConfig::default(), &mut place).unwrap();
         println!("{w:?}");
         assert_eq!(w.place, "Hà Nội");
-    }
-
-    #[test]
-    fn split_url_separates_host_and_path() {
-        assert_eq!(
-            split_url("https://api.open-meteo.com/v1/forecast?a=1"),
-            Some(("api.open-meteo.com", "/v1/forecast?a=1"))
-        );
-        assert_eq!(split_url("http://example.com/"), None); // chỉ nhận https
-        assert_eq!(split_url("https://example.com"), None); // thiếu đường dẫn
-    }
-
-    #[test]
-    fn percent_encode_handles_vietnamese_and_spaces() {
-        assert_eq!(percent_encode("Hà Nội"), "H%C3%A0%20N%E1%BB%99i");
-        assert_eq!(percent_encode("Da-Nang_1.~"), "Da-Nang_1.~");
     }
 
     #[test]

@@ -11,11 +11,16 @@ use windows::{
     },
     Win32::{
         Foundation::{HWND, LPARAM, WPARAM},
-        System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize},
+        System::{
+            SystemInformation::GetSystemTimePreciseAsFileTime,
+            WinRT::{RO_INIT_MULTITHREADED, RoInitialize},
+        },
         UI::WindowsAndMessaging::{PostMessageW, WM_APP},
     },
     core::Result,
 };
+
+use crate::lyrics::{Requester, Track};
 
 /// Luồng media gửi thông điệp này về cửa sổ khi bài hát/trạng thái đổi
 pub const WM_MEDIA_CHANGED: u32 = WM_APP + 1;
@@ -43,15 +48,58 @@ impl MediaCommand {
 pub struct MediaInfo {
     pub title: String,
     pub artist: String,
+    pub album: String,
     pub playing: bool,
+    /// Vị trí phát (ms) tại thời điểm `updated_ticks`; 0 nếu trình phát không báo
+    pub position_ms: u64,
+    /// Thời lượng bài (ms); 0 nếu không rõ
+    pub duration_ms: u64,
+    /// Lúc trình phát báo vị trí, đơn vị 100 ns kể từ năm 1601 (giống FILETIME)
+    pub updated_ticks: i64,
+}
+
+impl MediaInfo {
+    /// Bài này dưới dạng yêu cầu tra lời
+    fn as_track(&self) -> Track {
+        Track {
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            album: self.album.clone(),
+            duration_s: (self.duration_ms / 1000) as u32,
+        }
+    }
 }
 
 // Dữ liệu dùng chung: luồng media ghi, luồng giao diện đọc
 static MEDIA: Mutex<MediaInfo> = Mutex::new(MediaInfo {
     title: String::new(),
     artist: String::new(),
+    album: String::new(),
     playing: false,
+    position_ms: 0,
+    duration_ms: 0,
+    updated_ticks: 0,
 });
+
+/// Giờ hiện tại theo đồng hồ hệ thống, đơn vị 100 ns kể từ năm 1601
+pub fn now_ticks() -> i64 {
+    let ft = unsafe { GetSystemTimePreciseAsFileTime() };
+    ((u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)) as i64
+}
+
+/// Vị trí phát ngay lúc `now_ticks`. Trình phát chỉ báo vị trí thỉnh thoảng
+/// (khi phát, dừng, tua), nên lúc đang phát phải tự cộng thêm thời gian đã trôi qua
+pub fn position_at(info: &MediaInfo, now_ticks: i64) -> u64 {
+    let mut pos = info.position_ms;
+    if info.playing && info.updated_ticks > 0 && now_ticks > info.updated_ticks {
+        pos += ((now_ticks - info.updated_ticks) / 10_000) as u64; // 100 ns → ms
+    }
+    if info.duration_ms > 0 {
+        pos.min(info.duration_ms)
+    } else {
+        pos
+    }
+}
 
 /// Bản sao thông tin media mới nhất
 pub fn snapshot() -> MediaInfo {
@@ -62,11 +110,23 @@ fn query(manager: &GlobalSystemMediaTransportControlsSessionManager) -> Result<M
     let session = manager.GetCurrentSession()?;
     let props = session.TryGetMediaPropertiesAsync()?.join()?;
     let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
-    Ok(MediaInfo {
+    let mut info = MediaInfo {
         title: props.Title()?.to_string(),
         artist: props.Artist()?.to_string(),
+        album: props.AlbumTitle()?.to_string(),
         playing: status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing,
-    })
+        ..MediaInfo::default()
+    };
+    // Vị trí phát: không phải trình phát nào cũng báo, nên lỗi thì bỏ qua
+    if let Ok(timeline) = session.GetTimelineProperties() {
+        let ticks = |t: Result<windows::Foundation::TimeSpan>| t.map_or(0, |t| t.Duration);
+        let start = ticks(timeline.StartTime());
+        let to_ms = |t: i64| ((t - start).max(0) / 10_000) as u64; // 100 ns → ms
+        info.position_ms = to_ms(ticks(timeline.Position()));
+        info.duration_ms = to_ms(ticks(timeline.EndTime()));
+        info.updated_ticks = timeline.LastUpdatedTime().map_or(0, |d| d.UniversalTime);
+    }
+    Ok(info)
 }
 
 fn run_command(manager: &GlobalSystemMediaTransportControlsSessionManager, cmd: MediaCommand) {
@@ -82,7 +142,8 @@ fn run_command(manager: &GlobalSystemMediaTransportControlsSessionManager, cmd: 
 
 /// Vòng lặp của luồng media: nhận lệnh từ giao diện, hỏi trạng thái mỗi giây.
 /// `hwnd_raw` là HWND đổi sang số, vì HWND chứa con trỏ nên không gửi qua luồng được.
-pub fn run(hwnd_raw: isize, commands: Receiver<MediaCommand>) {
+/// `lyrics`: nếu bật lời bài hát, báo cho luồng lời mỗi khi đổi bài
+pub fn run(hwnd_raw: isize, commands: Receiver<MediaCommand>, lyrics: Option<Requester>) {
     unsafe {
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
     }
@@ -95,6 +156,8 @@ pub fn run(hwnd_raw: isize, commands: Receiver<MediaCommand>) {
     let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
 
     let mut last = MediaInfo::default();
+    let mut requested: Option<Track> = None;
+    let started_ticks = now_ticks();
     loop {
         match commands.recv_timeout(Duration::from_millis(1000)) {
             Ok(cmd) => {
@@ -105,7 +168,14 @@ pub fn run(hwnd_raw: isize, commands: Receiver<MediaCommand>) {
             Err(RecvTimeoutError::Disconnected) => return,
         }
 
-        let info = query(&manager).unwrap_or_default();
+        let info = fake_media(started_ticks).unwrap_or_else(|| query(&manager).unwrap_or_default());
+        if let Some(lyrics) = &lyrics {
+            let track = info.as_track();
+            if needs_lyrics_request(requested.as_ref(), &track) {
+                lyrics.request(track.clone());
+                requested = Some(track);
+            }
+        }
         if info != last {
             *MEDIA.lock().unwrap() = info.clone();
             unsafe {
@@ -116,9 +186,124 @@ pub fn run(hwnd_raw: isize, commands: Receiver<MediaCommand>) {
     }
 }
 
+/// Chỉ bản debug: ISLAND_FAKE_MEDIA="Tên bài|Nghệ sĩ|Album|thời lượng (giây)|bắt đầu từ giây"
+/// giả lập một bài đang phát (không có tiếng) để thử lời bài hát và thanh tiến độ
+fn fake_media(started_ticks: i64) -> Option<MediaInfo> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let value = std::env::var("ISLAND_FAKE_MEDIA").ok()?;
+    let parts: Vec<&str> = value.split('|').map(str::trim).collect();
+    let duration_s: u64 = parts.get(3)?.parse().ok()?;
+    let start_s: u64 = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some(MediaInfo {
+        title: parts[0].to_string(),
+        artist: parts.get(1)?.to_string(),
+        album: parts.get(2)?.to_string(),
+        playing: true,
+        position_ms: start_s * 1000,
+        duration_ms: duration_s * 1000,
+        updated_ticks: started_ticks,
+    })
+}
+
+/// Có cần tra lời lại không: đổi bài, hoặc lần trước chưa biết thời lượng mà giờ đã biết
+/// (biết thời lượng thì LRCLIB khớp chính xác hơn)
+fn needs_lyrics_request(requested: Option<&Track>, now: &Track) -> bool {
+    if now.title.is_empty() {
+        return false;
+    }
+    match requested {
+        None => true,
+        Some(r) => {
+            r.title != now.title
+                || r.artist != now.artist
+                || r.album != now.album
+                || (r.duration_s == 0 && now.duration_s > 0)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SECOND: i64 = 10_000_000; // 1 giây theo đơn vị 100 ns
+
+    fn playing_at(position_ms: u64, updated_ticks: i64) -> MediaInfo {
+        MediaInfo {
+            title: "Song".into(),
+            playing: true,
+            position_ms,
+            duration_ms: 146_000,
+            updated_ticks,
+            ..MediaInfo::default()
+        }
+    }
+
+    /// Đọc bài đang phát thật trên máy rồi tra lời; chạy bằng
+    /// `cargo test probe_current_media -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_current_media() {
+        unsafe {
+            let _ = RoInitialize(RO_INIT_MULTITHREADED);
+        }
+        let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+            .and_then(|op| op.join())
+            .unwrap();
+        let info = query(&manager).unwrap();
+        println!("media: {info:#?}");
+        println!("position now: {} ms", position_at(&info, now_ticks()));
+        let track = info.as_track();
+        let session = crate::http::Session::open().unwrap();
+        println!("lookup: {:?}", crate::lyrics::probe_fetch(&session, &track));
+    }
+
+    #[test]
+    fn position_advances_while_playing() {
+        let info = playing_at(29_000, 100 * SECOND);
+        assert_eq!(position_at(&info, 100 * SECOND), 29_000);
+        assert_eq!(position_at(&info, 102 * SECOND + SECOND / 2), 31_500);
+    }
+
+    #[test]
+    fn position_stays_when_paused_and_never_passes_the_end() {
+        let paused = MediaInfo {
+            playing: false,
+            ..playing_at(29_000, 100 * SECOND)
+        };
+        assert_eq!(position_at(&paused, 500 * SECOND), 29_000);
+        let near_end = playing_at(145_000, 100 * SECOND);
+        assert_eq!(position_at(&near_end, 200 * SECOND), 146_000);
+    }
+
+    #[test]
+    fn unknown_update_time_is_not_extrapolated() {
+        let info = playing_at(5_000, 0);
+        assert_eq!(position_at(&info, 999 * SECOND), 5_000);
+    }
+
+    #[test]
+    fn lyrics_are_requested_once_per_song() {
+        let song = |title: &str, duration_s| Track {
+            title: title.into(),
+            artist: "A".into(),
+            album: String::new(),
+            duration_s,
+        };
+        assert!(needs_lyrics_request(None, &song("X", 146)));
+        assert!(!needs_lyrics_request(
+            Some(&song("X", 146)),
+            &song("X", 146)
+        ));
+        assert!(needs_lyrics_request(Some(&song("X", 146)), &song("Y", 146)));
+        // Lần đầu chưa biết thời lượng, giờ đã biết: tra lại cho chính xác
+        assert!(needs_lyrics_request(Some(&song("X", 0)), &song("X", 146)));
+        assert!(!needs_lyrics_request(Some(&song("X", 146)), &song("X", 0)));
+        // Không có bài nào đang phát
+        assert!(!needs_lyrics_request(None, &song("", 0)));
+    }
 
     #[test]
     fn from_button_maps_buttons_left_to_right() {
