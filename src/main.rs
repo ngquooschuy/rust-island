@@ -9,14 +9,16 @@ mod backdrop; // nền Blur / Acrylic phía sau island
 mod battery; // trạng thái pin
 mod clipboard; // nội dung vừa sao chép
 mod config; // đọc file cấu hình config.toml
-mod content; // nội dung hiển thị và các trang (Idle, Media)
+mod content; // nội dung hiển thị và các trang (Idle, Media, Media Player)
 mod graphics; // vẽ bằng Direct2D + DirectComposition
 mod http; // HTTP GET bằng WinHTTP (thời tiết, lời bài hát)
 mod icon; // biểu tượng ứng dụng 64px và tên ứng dụng
 mod layout; // kích thước, vị trí nút
 mod lyrics; // lời bài hát chạy theo nhạc (LRCLIB + cache trên đĩa)
 mod media; // luồng nền đọc/điều khiển media
+mod meter; // mức âm thanh đang phát, cho sóng nhạc của trang Media Player
 mod notifications; // thông báo Windows mới nhất
+mod palette; // màu nhấn lấy từ ảnh bìa
 mod settings; // cửa sổ Cài đặt
 mod tray; // icon khay hệ thống
 mod weather; // luồng nền tải thời tiết từ Open-Meteo

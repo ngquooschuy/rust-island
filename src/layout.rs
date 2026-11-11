@@ -13,6 +13,8 @@ const EXPANDED_H: f32 = 116.0;
 const MEDIA_H: f32 = 160.0;
 /// Trang Media có khung lời bài hát: thêm 3 dòng lời
 const LYRICS_H: f32 = 248.0;
+/// Trang Media Player: ảnh bìa lớn, tên bài, sóng nhạc, thanh tiến độ, hàng nút
+const PLAYER_H: f32 = 208.0;
 /// Thông báo tạm thời (vừa sao chép, thông báo Windows): đủ cao cho biểu tượng và 3 dòng chữ
 const ALERT_H: f32 = 84.0;
 /// Island khi tự ẩn: chỉ còn một vạch nhỏ (notch)
@@ -37,6 +39,17 @@ pub const LYRICS_BUTTON: usize = 3;
 /// Tâm nút lời cách mép phải bao nhiêu (chừa chỗ cho hàng chấm dọc ở mép)
 const LYRICS_BTN_FROM_RIGHT: f32 = 44.0;
 
+/// Trang Media Player: lề hai bên, ảnh bìa (cạnh, mép trên), tâm dọc thanh tiến độ
+pub const PLAYER_PAD: f32 = 26.0;
+pub const PLAYER_COVER: f32 = 80.0;
+pub const PLAYER_COVER_TOP: f32 = 20.0;
+const PLAYER_PROGRESS_CY: f32 = 128.0;
+/// Thanh tiến độ: chừa chỗ bên trái cho giờ đã phát, bên phải cho giờ còn lại và hàng chấm
+const PLAYER_BAR_FROM_LEFT: f32 = PLAYER_PAD + 46.0;
+const PLAYER_BAR_FROM_RIGHT: f32 = 80.0;
+/// Bấm cách thanh tiến độ chừng này (theo chiều dọc) vẫn tính là bấm trúng để tua
+const SEEK_HIT_HALF_H: f32 = 10.0;
+
 /// Chấm phân trang khi thu gọn: nằm ngang, tâm cách đáy bao nhiêu
 const DOTS_FROM_BOTTOM: f32 = 8.0;
 /// Khi mở rộng: xếp dọc sát mép phải, tâm cách mép bao nhiêu
@@ -54,6 +67,8 @@ pub enum Expanded {
     Media,
     /// Trang Media có khung lời bài hát
     Lyrics,
+    /// Trang Media Player có bài đang phát
+    Player,
 }
 
 /// `Copy` vì chỉ chứa vài con số: truyền đi đâu cũng sao chép, không cần mượn
@@ -75,7 +90,7 @@ impl Layout {
     pub fn new(window: &WindowConfig) -> Self {
         Self {
             win_w: (window.expanded_width + MARGIN_X).ceil() as i32,
-            win_h: (EXPANDED_H.max(MEDIA_H).max(LYRICS_H) + MARGIN_Y) as i32,
+            win_h: (EXPANDED_H.max(MEDIA_H).max(LYRICS_H).max(PLAYER_H) + MARGIN_Y) as i32,
             top: window.top,
             collapsed: (window.collapsed_width, COLLAPSED_H),
             expanded: (window.expanded_width, EXPANDED_H),
@@ -118,6 +133,7 @@ impl Layout {
             Expanded::Plain => EXPANDED_H,
             Expanded::Media => MEDIA_H,
             Expanded::Lyrics => LYRICS_H,
+            Expanded::Player => PLAYER_H,
         };
         (self.expanded.0, h)
     }
@@ -146,6 +162,24 @@ impl Layout {
             let r = self.button_rect(i, h);
             x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
         })
+    }
+
+    /// Thanh tiến độ của trang Media Player: (mép trái, mép phải, tâm dọc)
+    pub fn player_bar(&self) -> (f32, f32, f32) {
+        let (el, right) = self.expanded_edges();
+        (
+            el + PLAYER_BAR_FROM_LEFT,
+            right - PLAYER_BAR_FROM_RIGHT,
+            PLAYER_PROGRESS_CY,
+        )
+    }
+
+    /// Bấm tại (x, y) trên trang Media Player: trúng thanh tiến độ thì trả về vị trí cần tua
+    /// tới (0 = đầu bài, 1 = cuối bài)
+    pub fn seek_at(&self, x: f32, y: f32) -> Option<f32> {
+        let (x0, x1, cy) = self.player_bar();
+        let near = (y - cy).abs() <= SEEK_HIT_HALF_H && x >= x0 - 6.0 && x <= x1 + 6.0;
+        near.then(|| ((x - x0) / (x1 - x0)).clamp(0.0, 1.0))
     }
 
     /// Điểm (x, y) có nằm trong island rộng `w`, cao `h` không?
@@ -194,7 +228,12 @@ impl Layout {
 mod tests {
     use super::*;
 
-    const KINDS: [Expanded; 3] = [Expanded::Plain, Expanded::Media, Expanded::Lyrics];
+    const KINDS: [Expanded; 4] = [
+        Expanded::Plain,
+        Expanded::Media,
+        Expanded::Lyrics,
+        Expanded::Player,
+    ];
 
     fn layout() -> Layout {
         Layout::new(&WindowConfig::default())
@@ -295,7 +334,7 @@ mod tests {
                 expanded_width: width,
                 ..WindowConfig::default()
             });
-            for kind in [Expanded::Media, Expanded::Lyrics] {
+            for kind in [Expanded::Media, Expanded::Lyrics, Expanded::Player] {
                 let (w, h) = l.expanded_size(kind);
                 for i in 0..=LYRICS_BUTTON {
                     let r = l.button_rect(i, h);
@@ -307,6 +346,38 @@ mod tests {
                 assert!(l.button_rect(LYRICS_BUTTON, h).left > next.right);
             }
         }
+    }
+
+    #[test]
+    fn player_page_fits_cover_bar_and_buttons() {
+        for width in [320.0, 400.0, 700.0] {
+            let l = Layout::new(&WindowConfig {
+                expanded_width: width,
+                ..WindowConfig::default()
+            });
+            let (w, h) = l.expanded_size(Expanded::Player);
+            assert!(h <= l.win_h as f32);
+            let (x0, x1, cy) = l.player_bar();
+            assert!(x1 - x0 > 100.0, "thanh tiến độ quá ngắn");
+            // Thanh tiến độ nằm dưới ảnh bìa và trên hàng nút
+            assert!(cy - 8.0 > PLAYER_COVER_TOP + PLAYER_COVER);
+            assert!(cy + 8.0 < l.button_rect(1, h).top);
+            // Chừa chỗ cho hàng chấm dọc ở mép phải
+            let (dots_x, _) = l.dots_center(w, h);
+            assert!(x1 + 40.0 < dots_x);
+        }
+    }
+
+    #[test]
+    fn seek_at_maps_bar_to_fraction() {
+        let l = layout();
+        let (x0, x1, cy) = l.player_bar();
+        assert_eq!(l.seek_at(x0, cy), Some(0.0));
+        assert_eq!(l.seek_at(x1, cy + 5.0), Some(1.0));
+        assert_eq!(l.seek_at((x0 + x1) / 2.0, cy), Some(0.5));
+        assert_eq!(l.seek_at(x0 - 3.0, cy), Some(0.0)); // hơi lệch mép vẫn tính
+        assert_eq!(l.seek_at((x0 + x1) / 2.0, cy + 30.0), None);
+        assert_eq!(l.seek_at(x1 + 30.0, cy), None);
     }
 
     #[test]

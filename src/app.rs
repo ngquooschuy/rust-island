@@ -23,12 +23,14 @@ use crate::alerts::{self, Alert};
 use crate::animation::{LineSlide, Spring};
 use crate::backdrop::Backdrop;
 use crate::clipboard::{self, Clip};
-use crate::config::{AutoHideConfig, ClockConfig, Config};
+use crate::config::{AutoHideConfig, ClockConfig, Color, Config};
 use crate::content::{self, Content, Page};
 use crate::graphics::{AlertView, CompactLyric, Frame, Graphics};
 use crate::icon::Icon;
 use crate::layout::{BUTTON_COUNT, Expanded, LYRICS_BUTTON, Layout};
 use crate::media::{self, MediaCommand};
+use crate::meter::{Meter, Wave};
+use crate::palette;
 use crate::settings;
 
 /// Một nấc con lăn chuột (WHEEL_DELTA); touchpad gửi nhiều số nhỏ cộng dồn lại
@@ -41,6 +43,8 @@ pub const TIMER_LYRICS: usize = 2;
 const LYRICS_TICK_MS: u32 = 150;
 /// Khi mở rộng, dòng lời được tô dần kiểu karaoke: vẽ lại ~30 lần mỗi giây cho mượt
 const KARAOKE_TICK_MS: u32 = 33;
+/// Sóng nhạc trên trang Media Player: vẽ lại ~25 lần mỗi giây
+const WAVE_TICK_MS: u32 = 40;
 /// Timer hết giờ hiện thông báo tạm thời
 pub const TIMER_ALERT: usize = 3;
 /// Timer chờ clipboard ổn định: một lần sao chép, app nguồn có thể ghi nhiều đợt liền nhau
@@ -117,6 +121,11 @@ pub struct App {
     alert: Option<ShownAlert>,    // thông báo đang hiện (hoặc đang mờ đi)
     /// Ảnh bìa bài đang phát và bản đã đưa lên card đồ họa
     cover: Option<(Arc<Icon>, ID2D1Bitmap1)>,
+    /// Màu nhấn lấy từ ảnh bìa (trang Media Player); None: dùng màu trong Cài đặt
+    cover_accent: Option<Color>,
+    /// Mức âm thanh đang phát, và các vạch sóng nhạc vẽ từ đó
+    meter: Meter,
+    wave: Wave,
 }
 
 impl App {
@@ -143,6 +152,9 @@ impl App {
             line_width: layout.collapsed.0,
             fast_timer: None,
             cover: None,
+            cover_accent: None,
+            meter: Meter::start(),
+            wave: Wave::default(),
             keep_tall: false,
             width: Spring::new(layout.collapsed.0),
             height: Spring::new(layout.collapsed.1),
@@ -230,6 +242,8 @@ impl App {
                 progress: self.slide.progress(Instant::now()),
             }),
             cover: self.cover.as_ref().map(|(_, bitmap)| bitmap),
+            cover_accent: self.cover_accent,
+            wave: &self.wave,
             alert: self.alert.as_ref().map(|a| AlertView {
                 alert: &a.alert,
                 icon: a.icon.as_ref(),
@@ -297,6 +311,8 @@ impl App {
             _ => false,
         };
         if !same {
+            // Ảnh mới thì tính lại màu nhấn (một lần mỗi bài, ảnh chỉ 96×96 nên rất nhanh)
+            self.cover_accent = wanted.as_deref().and_then(palette::accent_from);
             self.cover = wanted.and_then(|icon| {
                 let bitmap = self.graphics.icon_bitmap(&icon)?;
                 Some((icon, bitmap))
@@ -307,7 +323,7 @@ impl App {
     fn set_page(&mut self, hwnd: HWND, page: Page) {
         if page != self.page {
             self.page = page;
-            self.hover_button = None; // nút media không còn trên trang mới
+            self.hover_button = None; // nút ở trang cũ không còn trên trang mới
             self.refresh_line(hwnd); // câu lời chỉ hiện ở trang Media
             self.sync_target(hwnd); // trang Media có lời thì cao hơn
             self.update_fast_timer(hwnd);
@@ -318,13 +334,14 @@ impl App {
     fn buttons_active(&self) -> bool {
         self.hovered
             && !self.alert_active()
-            && self.page == Page::Media
+            && self.page.is_music()
             && !self.content.title.is_empty()
     }
 
     /// Số nút bấm được trên hàng nút: 3 nút nhạc, thêm nút lời nếu bật lời bài hát
+    /// (nút lời chỉ có ở trang Media)
     fn button_count(&self) -> usize {
-        BUTTON_COUNT + usize::from(self.lyrics_enabled)
+        BUTTON_COUNT + usize::from(self.lyrics_enabled && self.page == Page::Media)
     }
 
     fn set_hovered(&mut self, hwnd: HWND, hovered: bool) {
@@ -358,6 +375,8 @@ impl App {
                 Expanded::Lyrics
             } else if self.page == Page::Media && !self.content.title.is_empty() {
                 Expanded::Media
+            } else if self.page == Page::Player && !self.content.title.is_empty() {
+                Expanded::Player
             } else {
                 Expanded::Plain
             };
@@ -445,14 +464,34 @@ impl App {
             && self.content.lyrics.current_line().is_some()
     }
 
-    /// Bật timer nhanh khi đang hiện lời, tắt khi không cần để máy được nghỉ.
+    /// Trang Media Player đang mở rộng và đang phát: sóng nhạc chạy theo âm thanh
+    fn wave_live(&self) -> bool {
+        self.hovered
+            && !self.hidden
+            && !self.notch
+            && !self.alert_active()
+            && self.page == Page::Player
+            && self.content.playing
+            && !self.content.title.is_empty()
+    }
+
+    /// Bật timer nhanh khi đang hiện lời hoặc sóng nhạc, tắt khi không cần để máy được nghỉ.
     /// Mở rộng thì nhanh hơn nữa để chữ được tô mượt kiểu karaoke
     fn update_fast_timer(&mut self, hwnd: HWND) {
-        let want = self.lyrics_live().then_some(if self.hovered {
-            KARAOKE_TICK_MS
+        let wave = self.wave_live();
+        self.meter.set_wanted(wave);
+        if !wave {
+            self.wave = Wave::default();
+        }
+        let want = if wave {
+            Some(WAVE_TICK_MS)
         } else {
-            LYRICS_TICK_MS
-        });
+            self.lyrics_live().then_some(if self.hovered {
+                KARAOKE_TICK_MS
+            } else {
+                LYRICS_TICK_MS
+            })
+        };
         if want == self.fast_timer {
             return;
         }
@@ -553,6 +592,14 @@ impl App {
         if !self.buttons_active() {
             return;
         }
+        // Trang Media Player: bấm lên thanh tiến độ để tua tới chỗ đó
+        if self.page == Page::Player
+            && let (Some(fraction), Some(p)) = (self.layout.seek_at(x, y), self.content.progress)
+        {
+            let ms = (p.duration_ms as f64 * f64::from(fraction)) as u64;
+            let _ = self.commands.send(MediaCommand::Seek(ms));
+            return;
+        }
         match self
             .layout
             .button_at(x, y, self.height.value, self.button_count())
@@ -624,8 +671,13 @@ impl App {
         }
     }
 
-    /// Timer nhanh: chỉ vẽ lại khi dòng lời đổi
+    /// Timer nhanh: sóng nhạc nhảy theo âm thanh; lời thì chỉ vẽ lại khi dòng lời đổi
     pub fn on_lyrics_tick(&mut self, hwnd: HWND) {
+        if self.wave_live() {
+            self.wave.push(self.meter.level());
+            self.redraw_if_idle();
+            return;
+        }
         if self.is_animating() || self.hidden || self.notch {
             return;
         }

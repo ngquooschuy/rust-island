@@ -24,7 +24,9 @@ use crate::battery::Battery;
 use crate::config::{BackdropKind, Color, Config};
 use crate::content::{self, Content, LyricsView, Page, Progress};
 use crate::icon::Icon;
-use crate::layout::{LYRICS_BUTTON, Layout};
+use crate::layout::{LYRICS_BUTTON, Layout, PLAYER_COVER, PLAYER_COVER_TOP, PLAYER_PAD};
+use crate::meter::{WAVE_BARS, Wave};
+use crate::palette;
 use crate::weather::{Sky, Weather};
 
 /// Màu cố định cho trạng thái pin (theo màu hệ thống của Apple)
@@ -52,6 +54,10 @@ pub struct Frame<'a> {
     pub lyrics_panel: bool,
     /// Ảnh bìa bài đang phát (đã đưa lên card đồ họa)
     pub cover: Option<&'a ID2D1Bitmap1>,
+    /// Màu nhấn lấy từ ảnh bìa, cho trang Media Player (None: dùng màu trong Cài đặt)
+    pub cover_accent: Option<Color>,
+    /// Sóng nhạc của trang Media Player
+    pub wave: &'a Wave,
     /// Câu lời hiện trên island thu gọn (None: hiện tên bài như thường)
     pub compact_lyric: Option<CompactLyric<'a>>,
     /// Thông báo tạm thời đang hiện (hoặc đang mờ đi)
@@ -100,6 +106,18 @@ const PROGRESS_FROM_BOTTOM: f32 = 72.0;
 /// Độ đậm nền của nút tròn (chữ màu trắng phủ mờ lên nền island)
 const BUTTON_BG: f32 = 0.09;
 const PLAY_BG: f32 = 0.14;
+
+/// Trang Media Player: lớp màu nhấn phủ nhẹ lên nền (Accent Wash), đậm nhất ở góc trên trái
+const WASH_OPACITY: f32 = 0.22;
+/// Sóng nhạc: bề ngang cả cụm, cách mép phải island, bề rộng mỗi vạch, cao thấp nhất/nhất
+const WAVE_W: f32 = 62.0;
+const WAVE_FROM_RIGHT: f32 = 42.0;
+const WAVE_BAR_W: f32 = 3.5;
+const WAVE_MIN_H: f32 = 4.0;
+const WAVE_MAX_H: f32 = 34.0;
+/// Nút nhỏ trên góc ảnh bìa (cho biết đang phát hay dừng)
+const BADGE_R: f32 = 12.0;
+const BADGE_BG: Color = Color::rgb(0x16, 0x16, 0x18);
 
 /// Hạt nhiễu của nền Acrylic: ô vuông cạnh bao nhiêu điểm ảnh (lát lặp lại), và độ đậm
 const NOISE_SIZE: u32 = 128;
@@ -625,13 +643,14 @@ impl Graphics {
         if alpha_small > 0.0 {
             match page {
                 Page::Idle => self.draw_idle_compact(content, left, w, h, alpha_small),
-                Page::Media => self.draw_media_compact(frame, left, alpha_small),
+                Page::Media | Page::Player => self.draw_media_compact(frame, left, alpha_small),
             }
         }
         if alpha_big > 0.0 {
             match page {
                 Page::Idle => self.draw_idle_full(content, alpha_big),
                 Page::Media => self.draw_media_full(frame, alpha_big),
+                Page::Player => self.draw_player_full(frame, alpha_big),
             }
         }
         if let Some(view) = frame.alert.as_ref().filter(|a| a.alpha > 0.0) {
@@ -1136,7 +1155,7 @@ impl Graphics {
         if let Some(progress) = content.progress {
             self.draw_progress(progress, (el, right), frame.h - PROGRESS_FROM_BOTTOM, alpha);
         }
-        self.draw_controls(frame, alpha);
+        self.draw_controls(frame, alpha, self.accent, false);
     }
 
     /// Ảnh bìa bo góc trong ô `area`; chưa có ảnh thì vẽ ô xám với nốt nhạc
@@ -1311,8 +1330,35 @@ impl Graphics {
         }
     }
 
-    /// Hàng nút tròn ở đáy island: lùi, phát/dừng (to hơn), tới, và nút lời bên phải
-    fn draw_controls(&self, frame: &Frame, alpha: f32) {
+    /// Vạch đứng + tam giác (⏮ khi `dir` = -1, ⏭ khi `dir` = 1), tâm (cx, cy)
+    fn skip_icon(&self, cx: f32, cy: f32, dir: f32) {
+        let (half_w, half_h) = (6.0, 7.0);
+        let back = cx - dir * half_w; // đáy tam giác
+        let tip = cx + dir * (half_w - 3.0);
+        self.triangle([
+            (back + dir * 1.5, cy - half_h),
+            (back + dir * 1.5, cy + half_h),
+            (tip, cy),
+        ]);
+        let bar_x = tip + dir * 0.5;
+        let (l, r) = if dir > 0.0 {
+            (bar_x, bar_x + 2.5)
+        } else {
+            (bar_x - 2.5, bar_x)
+        };
+        self.fill(rounded(rect(l, cy - half_h, r, cy + half_h), 1.0));
+    }
+
+    /// Hàng nút tròn ở đáy island: lùi, phát/dừng (to hơn), tới; biểu tượng tô màu `accent`.
+    /// Trang Media: nút ⏪ ⏩ và nút lời bên phải. Trang Media Player (`player`): nút ⏮ ⏭
+    fn draw_controls(&self, frame: &Frame, alpha: f32, accent: Color, player: bool) {
+        let skip = |cx: f32, cy: f32, dir: f32| {
+            if player {
+                self.skip_icon(cx, cy, dir);
+            } else {
+                self.double_arrow(cx, cy, dir);
+            }
+        };
         let content = frame.content;
         let disc = |i: usize, base: f32| {
             let r = self.layout.button_rect(i, frame.h);
@@ -1328,11 +1374,11 @@ impl Graphics {
         };
 
         let (cx, cy) = disc(0, BUTTON_BG);
-        self.set_brush(self.accent, alpha);
-        self.double_arrow(cx, cy, -1.0);
+        self.set_brush(accent, alpha);
+        skip(cx, cy, -1.0);
 
         let (cx, cy) = disc(1, PLAY_BG);
-        self.set_brush(self.accent, alpha);
+        self.set_brush(accent, alpha);
         if content.playing {
             for x in [cx - 6.0, cx + 2.0] {
                 self.fill(rounded(rect(x, cy - 8.0, x + 4.0, cy + 8.0), 1.5));
@@ -1343,10 +1389,10 @@ impl Graphics {
         }
 
         let (cx, cy) = disc(2, BUTTON_BG);
-        self.set_brush(self.accent, alpha);
-        self.double_arrow(cx, cy, 1.0);
+        self.set_brush(accent, alpha);
+        skip(cx, cy, 1.0);
 
-        if self.lyrics_enabled {
+        if self.lyrics_enabled && !player {
             disc(LYRICS_BUTTON, BUTTON_BG);
             let r = self.layout.button_rect(LYRICS_BUTTON, frame.h);
             self.draw_lyrics_icon(r, frame.lyrics_on, alpha);
@@ -1396,5 +1442,189 @@ impl Graphics {
         self.fill(bar(x0, x.max(x0 + 4.0)));
         self.set_brush(self.text, alpha);
         self.circle(x, cy, 5.0);
+    }
+
+    // ---------- Trang Media Player ----------
+
+    /// Cọ tô chuyển màu theo đường thẳng từ `from` tới `to`; mỗi mốc là (vị trí 0–1, màu, độ đục)
+    fn gradient(
+        &self,
+        stops: &[(f32, Color, f32)],
+        from: (f32, f32),
+        to: (f32, f32),
+    ) -> Option<ID2D1LinearGradientBrush> {
+        let stops: Vec<D2D1_GRADIENT_STOP> = stops
+            .iter()
+            .map(|&(position, color, opacity)| {
+                let (r, g, b, a) = color.to_f32();
+                D2D1_GRADIENT_STOP {
+                    position,
+                    color: D2D1_COLOR_F {
+                        r,
+                        g,
+                        b,
+                        a: a * opacity,
+                    },
+                }
+            })
+            .collect();
+        unsafe {
+            // Bản đơn giản của ID2D1RenderTarget (bản của DeviceContext cần thêm 3 tham số)
+            let target: &ID2D1RenderTarget = &self.d2d_context;
+            let collection = target
+                .CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+                .ok()?;
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: Vector2 {
+                    X: from.0,
+                    Y: from.1,
+                },
+                endPoint: Vector2 { X: to.0, Y: to.1 },
+            };
+            self.d2d_context
+                .CreateLinearGradientBrush(&props, None, &collection)
+                .ok()
+        }
+    }
+
+    /// Trang Media Player mở rộng (màu nhấn lấy từ ảnh bìa):
+    ///   [ẢNH BÌA]  Tên bài            sóng nhạc
+    ///              Nghệ sĩ
+    ///   1:42 ━━━━━━━━●──────────── -2:19
+    ///          (lùi)  (phát/dừng)  (tới)
+    fn draw_player_full(&self, frame: &Frame, alpha: f32) {
+        let content = frame.content;
+        let (el, right) = self.expanded_edges();
+        if content.title.is_empty() {
+            self.set_brush(self.secondary, alpha);
+            self.draw_text(
+                "Không có nhạc đang phát",
+                &self.fmt_date,
+                rect(el, 10.0, right, 92.0),
+            );
+            return;
+        }
+        let accent = frame.cover_accent.unwrap_or(self.accent);
+        self.draw_wash(frame, accent, alpha);
+
+        let x = el + PLAYER_PAD;
+        let cover = rect(
+            x,
+            PLAYER_COVER_TOP,
+            x + PLAYER_COVER,
+            PLAYER_COVER_TOP + PLAYER_COVER,
+        );
+        self.draw_cover(frame.cover, cover, 16.0, alpha);
+        self.draw_badge(cover, content.playing, accent, alpha);
+
+        let cy = PLAYER_COVER_TOP + PLAYER_COVER / 2.0;
+        let wave_right = right - WAVE_FROM_RIGHT;
+        let wave_left = wave_right - WAVE_W;
+        self.draw_wave(frame.wave, wave_left, cy, accent, content.playing, alpha);
+
+        let x0 = cover.right + 18.0;
+        let max_w = wave_left - 14.0 - x0;
+        let (title, f) = self.fit_text(&content.full_title, &[&self.fmt_media_title], max_w);
+        self.set_brush(self.text, alpha);
+        self.draw_text(&title, f, rect(x0, cy - 24.0, x0 + max_w, cy + 1.0));
+        let (artist, f) = self.fit_text(&content.full_artist, &[&self.fmt_alert_body], max_w);
+        self.set_brush(self.secondary, alpha);
+        self.draw_text(&artist, f, rect(x0, cy + 3.0, x0 + max_w, cy + 23.0));
+
+        if let Some(progress) = content.progress {
+            self.draw_player_progress(progress, accent, alpha);
+        }
+        self.draw_controls(frame, alpha, accent, true);
+    }
+
+    /// Accent Wash: phủ màu nhấn rất nhạt lên nền, đậm ở góc trên trái, nhạt dần về góc dưới phải
+    fn draw_wash(&self, frame: &Frame, accent: Color, alpha: f32) {
+        let left = self.layout.island_left(frame.w);
+        let pill = rounded(
+            rect(left, 0.0, left + frame.w, frame.h),
+            Layout::corner_radius(frame.h),
+        );
+        let stops = [
+            (0.0, accent, WASH_OPACITY),
+            (0.55, accent, WASH_OPACITY * 0.25),
+            (1.0, accent, 0.0),
+        ];
+        let to = (left + frame.w * 0.75, frame.h);
+        if let Some(brush) = self.gradient(&stops, (left, 0.0), to) {
+            unsafe {
+                brush.SetOpacity(alpha);
+                self.d2d_context.FillRoundedRectangle(&pill, &brush);
+            }
+        }
+    }
+
+    /// Nút tròn nhỏ ở góc dưới phải ảnh bìa: tam giác khi đang dừng, hai vạch khi đang phát
+    fn draw_badge(&self, cover: D2D_RECT_F, playing: bool, accent: Color, alpha: f32) {
+        let (cx, cy) = (cover.right - BADGE_R + 2.0, cover.bottom - BADGE_R + 2.0);
+        self.set_brush(BADGE_BG, alpha * 0.92);
+        self.circle(cx, cy, BADGE_R);
+        self.set_brush(accent, alpha);
+        if playing {
+            for x in [cx - 4.0, cx + 1.0] {
+                self.fill(rounded(rect(x, cy - 5.0, x + 3.0, cy + 5.0), 1.0));
+            }
+        } else {
+            self.triangle([(cx - 3.5, cy - 6.0), (cx - 3.5, cy + 6.0), (cx + 6.0, cy)]);
+        }
+    }
+
+    /// Sóng nhạc: các vạch dọc căn giữa theo `cy`, cao thấp theo mức âm thanh vừa đo.
+    /// Đang dừng thì chỉ còn các vạch thấp, nhạt
+    fn draw_wave(&self, wave: &Wave, left: f32, cy: f32, accent: Color, playing: bool, alpha: f32) {
+        let step = WAVE_W / WAVE_BARS as f32;
+        let opacity = if playing { 1.0 } else { 0.45 };
+        self.set_brush(accent, alpha * opacity);
+        for (i, level) in wave.bars.iter().enumerate() {
+            let h = WAVE_MIN_H + (WAVE_MAX_H - WAVE_MIN_H) * level.clamp(0.0, 1.0);
+            let x = left + step * i as f32 + (step - WAVE_BAR_W) / 2.0;
+            let bar = rect(x, cy - h / 2.0, x + WAVE_BAR_W, cy + h / 2.0);
+            self.fill(rounded(bar, WAVE_BAR_W / 2.0));
+        }
+    }
+
+    /// "1:42 ━━━━━●────── -2:19": phần đã phát tô chuyển màu từ màu nhấn nhạt sang màu nhấn,
+    /// núm tròn trắng viền màu nhấn. Bấm lên thanh để tua (xem app.rs)
+    fn draw_player_progress(&self, p: Progress, accent: Color, alpha: f32) {
+        let (el, right) = self.expanded_edges();
+        let (x0, x1, cy) = self.layout.player_bar();
+        let (top, bottom) = (cy - 9.0, cy + 9.0);
+        self.set_brush(self.secondary, alpha);
+        self.draw_text(
+            &content::mmss(p.elapsed_ms),
+            &self.fmt_tiny,
+            rect(el + PLAYER_PAD - 6.0, top, x0 - 6.0, bottom),
+        );
+        let remaining = p.duration_ms.saturating_sub(p.elapsed_ms);
+        self.draw_text(
+            &format!("-{}", content::mmss(remaining)),
+            &self.fmt_tiny,
+            rect(x1 + 6.0, top, right - 30.0, bottom),
+        );
+
+        let bar = |from: f32, to: f32| rounded(rect(from, cy - 2.5, to, cy + 2.5), 2.5);
+        self.set_brush(self.text, alpha * 0.14);
+        self.fill(bar(x0, x1));
+        let x = x0 + (x1 - x0) * p.fraction();
+        let stops = [
+            (0.0, palette::lighten(accent, 0.45), 1.0),
+            (1.0, accent, 1.0),
+        ];
+        // Chuyển màu trải trên phần đã phát, nên sát núm luôn là màu nhấn đậm nhất
+        if let Some(brush) = self.gradient(&stops, (x0, cy), (x.max(x0 + 1.0), cy)) {
+            unsafe {
+                brush.SetOpacity(alpha);
+                self.d2d_context
+                    .FillRoundedRectangle(&bar(x0, x.max(x0 + 5.0)), &brush);
+            }
+        }
+        self.set_brush(accent, alpha);
+        self.circle(x, cy, 7.5);
+        self.set_brush(Color::rgb(0xFF, 0xFF, 0xFF), alpha);
+        self.circle(x, cy, 5.5);
     }
 }

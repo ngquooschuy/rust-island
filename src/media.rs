@@ -36,6 +36,8 @@ pub enum MediaCommand {
     Previous,
     TogglePlayPause,
     Next,
+    /// Tua tới vị trí này (ms tính từ đầu bài)
+    Seek(u64),
 }
 
 impl MediaCommand {
@@ -214,6 +216,10 @@ fn run_command(manager: &GlobalSystemMediaTransportControlsSessionManager, cmd: 
             MediaCommand::Previous => session.TrySkipPreviousAsync(),
             MediaCommand::TogglePlayPause => session.TryTogglePlayPauseAsync(),
             MediaCommand::Next => session.TrySkipNextAsync(),
+            // Windows tính vị trí theo đơn vị 100 ns
+            MediaCommand::Seek(ms) => {
+                session.TryChangePlaybackPositionAsync(ms.saturating_mul(10_000) as i64)
+            }
         };
         let _ = op.and_then(|op| op.join());
     }

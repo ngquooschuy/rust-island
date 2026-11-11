@@ -146,12 +146,20 @@ impl Content {
 pub enum Page {
     /// Đồng hồ + thời tiết
     Idle,
-    /// Bài đang phát + nút điều khiển
+    /// Bài đang phát + nút điều khiển (+ lời bài hát)
     Media,
+    /// Trình phát nhạc: ảnh bìa lớn, sóng nhạc, tua được; màu nhấn theo ảnh bìa
+    Player,
 }
 
 impl Page {
-    pub const ALL: [Page; 2] = [Page::Idle, Page::Media];
+    /// Thứ tự khi lăn chuột xuống
+    pub const ALL: [Page; 3] = [Page::Idle, Page::Media, Page::Player];
+
+    /// Trang về nhạc (Media, Media Player): có bài đang phát thì có nút điều khiển
+    pub fn is_music(self) -> bool {
+        matches!(self, Page::Media | Page::Player)
+    }
 
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|&p| p == self).unwrap()
@@ -177,11 +185,15 @@ impl Page {
         }
     }
 
-    /// Tự chuyển trang khi media đổi: bắt đầu phát/đổi bài thì sang Media,
-    /// hết bài thì về Idle, còn lại giữ trang người dùng đang chọn
+    /// Tự chuyển trang khi media đổi: bắt đầu phát/đổi bài thì sang Media (đang ở Media
+    /// Player thì ở lại), hết bài thì về Idle, còn lại giữ trang người dùng đang chọn
     pub fn after_media_change(self, old: &Content, new: &Content) -> Self {
         if new.started_playback_since(old) {
-            Self::Media
+            if self == Self::Player {
+                self
+            } else {
+                Self::Media
+            }
         } else if new.title.is_empty() && !old.title.is_empty() {
             Self::Idle
         } else {
@@ -542,9 +554,28 @@ mod tests {
 
     #[test]
     fn page_step_wraps_around_both_ways() {
+        // Lăn xuống: Idle → Media → Media Player → Idle
         assert_eq!(Page::Idle.step(true), Page::Media);
-        assert_eq!(Page::Media.step(true), Page::Idle);
-        assert_eq!(Page::Idle.step(false), Page::Media);
+        assert_eq!(Page::Media.step(true), Page::Player);
+        assert_eq!(Page::Player.step(true), Page::Idle);
+        assert_eq!(Page::Idle.step(false), Page::Player);
+        assert_eq!(Page::Player.step(false), Page::Media);
+    }
+
+    #[test]
+    fn player_page_stays_when_song_changes_and_leaves_when_music_stops() {
+        let next_song = Content {
+            full_title: "Bài khác".into(),
+            title: "Bài khác".into(),
+            ..with_song(true)
+        };
+        let page = Page::Player.after_media_change(&with_song(true), &next_song);
+        assert_eq!(page, Page::Player);
+        let page = Page::Player.after_media_change(&with_song(true), &idle());
+        assert_eq!(page, Page::Idle);
+        assert!(Page::Player.is_music() && Page::Media.is_music() && !Page::Idle.is_music());
+        // Khung lời chỉ có ở trang Media
+        assert!(!with_song(true).shows_lyrics_panel(Page::Player, true));
     }
 
     #[test]
