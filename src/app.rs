@@ -289,7 +289,8 @@ impl App {
 
     /// Ảnh bìa của bài đang phát: đổi ảnh thì đưa ảnh mới lên card đồ họa
     fn refresh_cover(&mut self) {
-        let wanted = media::cover_for(&self.content.title, &self.content.artist);
+        // Tên đầy đủ: tên đã cắt ngắn ("Nếu Như Ta Chẳng Còn (feat. …") không khớp ảnh nào
+        let wanted = media::cover_for(&self.content.full_title, &self.content.full_artist);
         let same = match (&self.cover, &wanted) {
             (Some((old, _)), Some(new)) => Arc::ptr_eq(old, new),
             (None, None) => true,

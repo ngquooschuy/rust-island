@@ -31,8 +31,12 @@ pub struct Content {
     pub day_short: String,
     /// "♪ Tên bài" đã cắt ngắn, dùng khi thu gọn
     pub song: String,
+    /// Tên bài, nghệ sĩ đã cắt ngắn để hiển thị
     pub title: String,
     pub artist: String,
+    /// Tên bài, nghệ sĩ đầy đủ như trình phát báo: để tìm ảnh bìa và lời của đúng bài
+    pub full_title: String,
+    pub full_artist: String,
     pub playing: bool,
     pub battery: Option<Battery>,
     /// None khi chưa tải được hoặc đã tắt trong cấu hình
@@ -298,6 +302,8 @@ fn build(
         song: format!("♪ {}", truncate(&media.title, 18)),
         title: truncate(&media.title, 28),
         artist: truncate(&media.artist, 30),
+        full_title: media.title.clone(),
+        full_artist: media.artist.clone(),
         playing: media.playing,
         battery,
         // current() điền vào sau
@@ -360,6 +366,21 @@ mod tests {
         hour24: false,
         show_seconds: true,
     };
+
+    #[test]
+    fn long_names_are_shortened_for_display_but_kept_in_full() {
+        let media = MediaInfo {
+            title: "Nếu Như Ta Chẳng Còn (feat. Ca Sĩ Khách Mời)".into(),
+            artist: "RPT MCK, Một Nghệ Sĩ Có Tên Rất Dài".into(),
+            playing: true,
+            ..MediaInfo::default()
+        };
+        let c = build(&time(), &media, None, &H24);
+        assert!(c.title.ends_with('…') && c.artist.ends_with('…'));
+        // Ảnh bìa được tìm theo tên đầy đủ, nên tên dài vẫn có ảnh
+        assert_eq!(c.full_title, media.title);
+        assert_eq!(c.full_artist, media.artist);
+    }
 
     fn idle() -> Content {
         build(&time(), &MediaInfo::default(), None, &H24)
