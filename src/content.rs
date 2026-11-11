@@ -185,15 +185,15 @@ impl Page {
         }
     }
 
-    /// Tự chuyển trang khi media đổi: bắt đầu phát/đổi bài thì sang Media (đang ở Media
-    /// Player thì ở lại), hết bài thì về Idle, còn lại giữ trang người dùng đang chọn
-    pub fn after_media_change(self, old: &Content, new: &Content) -> Self {
+    /// Tự chuyển trang khi media đổi: bắt đầu phát/đổi bài thì sang trang nhạc (đang ở
+    /// trang nhạc thì ở lại, không thì về `music_page`, trang nhạc người dùng chọn gần nhất),
+    /// hết bài thì về Idle, còn lại giữ trang người dùng đang chọn.
+    /// Lúc bấm chuyển bài, trình phát thường báo "không có bài" trong chốc lát: island về Idle
+    /// rồi khi bài mới phát thì nhờ `music_page` mà quay lại đúng trang cũ (Media Player
+    /// vẫn là Media Player)
+    pub fn after_media_change(self, old: &Content, new: &Content, music_page: Page) -> Self {
         if new.started_playback_since(old) {
-            if self == Self::Player {
-                self
-            } else {
-                Self::Media
-            }
+            if self.is_music() { self } else { music_page }
         } else if new.title.is_empty() && !old.title.is_empty() {
             Self::Idle
         } else {
@@ -569,9 +569,9 @@ mod tests {
             title: "Bài khác".into(),
             ..with_song(true)
         };
-        let page = Page::Player.after_media_change(&with_song(true), &next_song);
+        let page = Page::Player.after_media_change(&with_song(true), &next_song, Page::Player);
         assert_eq!(page, Page::Player);
-        let page = Page::Player.after_media_change(&with_song(true), &idle());
+        let page = Page::Player.after_media_change(&with_song(true), &idle(), Page::Player);
         assert_eq!(page, Page::Idle);
         assert!(Page::Player.is_music() && Page::Media.is_music() && !Page::Idle.is_music());
         // Khung lời chỉ có ở trang Media
@@ -586,8 +586,27 @@ mod tests {
     }
 
     #[test]
+    fn next_song_gap_returns_to_the_music_page_in_use() {
+        // Bấm "bài tiếp" ở trang Media Player: trình phát báo trống một lúc rồi phát bài mới
+        let old = with_song(true);
+        let gap = idle();
+        let next_song = Content {
+            full_title: "Bài tiếp".into(),
+            title: "Bài tiếp".into(),
+            ..with_song(true)
+        };
+        let page = Page::Player.after_media_change(&old, &gap, Page::Player);
+        assert_eq!(page, Page::Idle);
+        let page = page.after_media_change(&gap, &next_song, Page::Player);
+        assert_eq!(page, Page::Player);
+        // Đang xem trang Media thì vẫn về Media
+        let page = Page::Idle.after_media_change(&gap, &next_song, Page::Media);
+        assert_eq!(page, Page::Media);
+    }
+
+    #[test]
     fn page_switches_to_media_when_playback_starts() {
-        let page = Page::Idle.after_media_change(&with_song(false), &with_song(true));
+        let page = Page::Idle.after_media_change(&with_song(false), &with_song(true), Page::Media);
         assert_eq!(page, Page::Media);
     }
 
@@ -602,14 +621,14 @@ mod tests {
 
     #[test]
     fn page_returns_to_idle_when_media_disappears() {
-        let page = Page::Media.after_media_change(&with_song(true), &idle());
+        let page = Page::Media.after_media_change(&with_song(true), &idle(), Page::Media);
         assert_eq!(page, Page::Idle);
     }
 
     #[test]
     fn user_choice_is_kept_when_only_pausing() {
         // Người dùng đang xem Idle khi nhạc phát; tạm dừng không được kéo sang trang khác
-        let page = Page::Idle.after_media_change(&with_song(true), &with_song(false));
+        let page = Page::Idle.after_media_change(&with_song(true), &with_song(false), Page::Media);
         assert_eq!(page, Page::Idle);
     }
 

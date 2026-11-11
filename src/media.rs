@@ -3,7 +3,7 @@
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::{
     Graphics::Imaging::{
         BitmapAlphaMode, BitmapBounds, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat,
@@ -210,6 +210,42 @@ fn query(manager: &GlobalSystemMediaTransportControlsSessionManager) -> Result<M
     Ok(info)
 }
 
+/// Lúc chuyển bài (bấm lùi/tới, hết bài tự sang bài sau), trình phát thường báo "không có
+/// bài" trong chốc lát. Coi đó là hết nhạc thì island co lại và về trang Idle rồi lại mở ra:
+/// nên trong khoảng này cứ giữ bài cũ, quá thời gian mà vẫn trống mới là hết nhạc thật
+const MEDIA_GAP_HOLD: Duration = Duration::from_secs(3);
+
+/// Giữ bài đang phát qua khoảng trống ngắn lúc chuyển bài
+#[derive(Default)]
+struct GapHold {
+    /// Bài gần nhất có tên
+    last: MediaInfo,
+    /// Trình phát bắt đầu báo trống từ lúc nào
+    empty_since: Option<Instant>,
+}
+
+impl GapHold {
+    /// Thông tin nên dùng lúc `now`: trống chưa quá MEDIA_GAP_HOLD thì vẫn là bài cũ
+    fn filter(&mut self, info: MediaInfo, now: Instant) -> MediaInfo {
+        if !info.title.is_empty() {
+            self.last = info.clone();
+            self.empty_since = None;
+            return info;
+        }
+        if self.last.title.is_empty() {
+            return info; // chưa có bài nào để giữ
+        }
+        let since = *self.empty_since.get_or_insert(now);
+        if now.duration_since(since) < MEDIA_GAP_HOLD {
+            self.last.clone()
+        } else {
+            // Trống đủ lâu: hết nhạc thật (đóng trình phát, tắt tab...)
+            *self = Self::default();
+            info
+        }
+    }
+}
+
 fn run_command(manager: &GlobalSystemMediaTransportControlsSessionManager, cmd: MediaCommand) {
     if let Ok(session) = manager.GetCurrentSession() {
         let op = match cmd {
@@ -241,6 +277,7 @@ pub fn run(hwnd_raw: isize, commands: Receiver<MediaCommand>, lyrics: Option<Req
     let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
 
     let mut last = MediaInfo::default();
+    let mut gap = GapHold::default();
     let mut requested: Option<Track> = None;
     let started_ticks = now_ticks();
     // Bài đang lấy ảnh bìa, và còn thử được mấy lần
@@ -257,6 +294,7 @@ pub fn run(hwnd_raw: isize, commands: Receiver<MediaCommand>, lyrics: Option<Req
         }
 
         let info = fake_media(started_ticks).unwrap_or_else(|| query(&manager).unwrap_or_default());
+        let info = gap.filter(info, Instant::now());
         if let Some(lyrics) = &lyrics {
             let track = info.as_track();
             if needs_lyrics_request(requested.as_ref(), &track) {
@@ -373,6 +411,45 @@ mod tests {
         let track = info.as_track();
         let session = crate::http::Session::open().unwrap();
         println!("lookup: {:?}", crate::lyrics::probe_fetch(&session, &track));
+    }
+
+    fn named(title: &str) -> MediaInfo {
+        MediaInfo {
+            title: title.into(),
+            artist: "Ca sĩ".into(),
+            playing: true,
+            ..MediaInfo::default()
+        }
+    }
+
+    #[test]
+    fn short_gap_while_changing_song_keeps_the_old_song() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut gap = GapHold::default();
+        assert_eq!(gap.filter(named("Bài A"), at(0)).title, "Bài A");
+        // Bấm "bài tiếp": trình phát báo trống chừng 1–2 giây
+        assert_eq!(gap.filter(MediaInfo::default(), at(1000)).title, "Bài A");
+        assert_eq!(gap.filter(MediaInfo::default(), at(2500)).title, "Bài A");
+        // Bài mới tới: dùng ngay
+        assert_eq!(gap.filter(named("Bài B"), at(3000)).title, "Bài B");
+        // Khoảng trống sau đó được tính lại từ đầu
+        assert_eq!(gap.filter(MediaInfo::default(), at(5000)).title, "Bài B");
+    }
+
+    #[test]
+    fn long_silence_means_music_really_stopped() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut gap = GapHold::default();
+        gap.filter(named("Bài A"), at(0));
+        assert_eq!(gap.filter(MediaInfo::default(), at(1000)).title, "Bài A");
+        assert_eq!(gap.filter(MediaInfo::default(), at(4100)).title, "");
+        // Đã hết nhạc thì không giữ lại bài cũ nữa
+        assert_eq!(gap.filter(MediaInfo::default(), at(5000)).title, "");
+        // Chưa từng có bài: trống thì vẫn trống
+        let mut fresh = GapHold::default();
+        assert_eq!(fresh.filter(MediaInfo::default(), at(0)).title, "");
     }
 
     #[test]

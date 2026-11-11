@@ -104,6 +104,8 @@ pub struct App {
     height: Spring,
     content: Content,
     page: Page,
+    /// Trang nhạc người dùng xem gần nhất (Media hoặc Media Player): nhạc phát lại thì về đó
+    music_page: Page,
     wheel: i32, // con lăn cộng dồn, chưa đủ một nấc
     hovered: bool,
     notch: bool,          // đang tự ẩn thành notch? (không bao giờ đúng khi `hovered`)
@@ -159,6 +161,7 @@ impl App {
             width: Spring::new(layout.collapsed.0),
             height: Spring::new(layout.collapsed.1),
             page: Page::initial(&content),
+            music_page: Page::Media,
             content,
             wheel: 0,
             hovered: false,
@@ -323,6 +326,9 @@ impl App {
     fn set_page(&mut self, hwnd: HWND, page: Page) {
         if page != self.page {
             self.page = page;
+            if page.is_music() {
+                self.music_page = page;
+            }
             self.hover_button = None; // nút ở trang cũ không còn trên trang mới
             self.refresh_line(hwnd); // câu lời chỉ hiện ở trang Media
             self.sync_target(hwnd); // trang Media có lời thì cao hơn
@@ -705,7 +711,9 @@ impl App {
         if new.started_playback_since(&self.content) {
             self.wake(hwnd); // bài mới: hiện lại nếu đang là notch
         }
-        let page = self.page.after_media_change(&self.content, &new);
+        let page = self
+            .page
+            .after_media_change(&self.content, &new, self.music_page);
         self.content = new;
         self.refresh_cover();
         if page != self.page {
