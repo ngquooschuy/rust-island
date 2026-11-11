@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::Timing;
 use super::lrclib::Track;
 
 /// Lời đã lưu quá lâu thì tra lại LRCLIB (có thể đã được sửa/đồng bộ tốt hơn)
@@ -34,6 +35,22 @@ pub struct Entry {
     duration_s: u32,
     pub synced: Option<String>,
     pub plain: Option<String>,
+    /// Bản lời dài khác bài đang phát (vd. video MV): lời có thể lệch.
+    /// File cũ không có hai trường này: lấy mặc định (không lệch)
+    #[serde(default)]
+    pub approximate: bool,
+    /// Người dùng chỉnh lời sớm/muộn cho bài này (ms, dương = lời muộn hơn)
+    #[serde(default)]
+    pub offset_ms: i64,
+}
+
+impl Entry {
+    pub fn timing(&self) -> Timing {
+        Timing {
+            offset_ms: self.offset_ms,
+            approximate: self.approximate,
+        }
+    }
 }
 
 /// Thông tin một file trong thư mục cache
@@ -154,8 +171,31 @@ impl Cache {
         t: &Track,
         synced: Option<String>,
         plain: Option<String>,
+        timing: Timing,
     ) -> io::Result<()> {
-        self.store_at(t, synced, plain, SystemTime::now())
+        self.store_at(t, synced, plain, timing, SystemTime::now())
+    }
+
+    /// Ghi độ lệch người dùng vừa chỉnh vào file của bài (bài chưa có trong cache thì thôi)
+    pub fn set_offset(&self, t: &Track, offset_ms: i64) -> io::Result<()> {
+        let path = self.file_for(t);
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let Ok(mut entry) = serde_json::from_str::<Entry>(&text) else {
+            return Ok(());
+        };
+        entry.offset_ms = offset_ms;
+        self.write(&path, &entry)
+    }
+
+    /// Ghi ra file tạm rồi đổi tên: đang ghi mà tắt máy cũng không để lại file hỏng
+    fn write(&self, path: &Path, entry: &Entry) -> io::Result<()> {
+        let json = serde_json::to_string(entry).map_err(io::Error::other)?;
+        fs::create_dir_all(&self.dir)?;
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, path)
     }
 
     fn store_at(
@@ -163,6 +203,7 @@ impl Cache {
         t: &Track,
         synced: Option<String>,
         plain: Option<String>,
+        timing: Timing,
         now: SystemTime,
     ) -> io::Result<()> {
         if synced.is_none() && plain.is_none() {
@@ -177,14 +218,10 @@ impl Cache {
             duration_s: t.duration_s,
             synced,
             plain,
+            approximate: timing.approximate,
+            offset_ms: timing.offset_ms,
         };
-        let json = serde_json::to_string(&entry).map_err(io::Error::other)?;
-        fs::create_dir_all(&self.dir)?;
-        // Ghi ra file tạm rồi đổi tên, để lỡ tắt máy giữa chừng cũng không có file hỏng
-        let path = self.file_for(t);
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, &path)?;
+        self.write(&self.file_for(t), &entry)?;
         self.evict()
     }
 
@@ -291,7 +328,13 @@ mod tests {
         let cache = Cache::new(tmp.0.clone(), 25).unwrap();
         let t = track("Mortals Funk Remix");
         cache
-            .store_at(&t, Some("[00:01.00] hi".into()), None, at(1_000))
+            .store_at(
+                &t,
+                Some("[00:01.00] hi".into()),
+                None,
+                Timing::default(),
+                at(1_000),
+            )
             .unwrap();
         let (entry, fresh) = cache.load_at(&t, at(2_000)).unwrap();
         assert_eq!(entry.synced.as_deref(), Some("[00:01.00] hi"));
@@ -300,10 +343,51 @@ mod tests {
     }
 
     #[test]
+    fn offset_and_approximate_flag_are_saved() {
+        let tmp = TempDir::new("offset");
+        let cache = Cache::new(tmp.0.clone(), 25).unwrap();
+        let t = track("Buông Đôi Tay Nhau Ra");
+        let timing = Timing {
+            offset_ms: 0,
+            approximate: true,
+        };
+        cache
+            .store(&t, Some("[00:17.13] a".into()), None, timing)
+            .unwrap();
+        cache.set_offset(&t, 55_500).unwrap();
+        let (entry, _) = cache.load(&t).unwrap();
+        assert_eq!(
+            entry.timing(),
+            Timing {
+                offset_ms: 55_500,
+                approximate: true,
+            }
+        );
+        // Bài chưa có trong cache: không tạo file mới
+        cache.set_offset(&track("Khác"), 1_000).unwrap();
+        assert_eq!(cache.stats().0, 1);
+    }
+
+    #[test]
+    fn old_files_without_timing_still_load() {
+        let tmp = TempDir::new("oldformat");
+        let cache = Cache::new(tmp.0.clone(), 25).unwrap();
+        let t = track("Cũ");
+        let json = r#"{"version":1,"fetched_at":1,"title":"Cũ","artist":"LXNGVX, Warriyo","album":"Mortals Funk Remix",
+            "duration_s":100,"synced":"[00:01.00] a","plain":null}"#;
+        fs::create_dir_all(&tmp.0).unwrap();
+        fs::write(cache.file_for(&t), json).unwrap();
+        let (entry, _) = cache.load(&t).unwrap();
+        assert_eq!(entry.timing(), Timing::default());
+    }
+
+    #[test]
     fn songs_without_lyrics_are_not_stored() {
         let tmp = TempDir::new("nolyrics");
         let cache = Cache::new(tmp.0.clone(), 25).unwrap();
-        cache.store(&track("Instrumental"), None, None).unwrap();
+        cache
+            .store(&track("Instrumental"), None, None, Timing::default())
+            .unwrap();
         assert_eq!(cache.stats(), (0, 0));
     }
 
@@ -313,7 +397,7 @@ mod tests {
         let cache = Cache::new(tmp.0.clone(), 25).unwrap();
         let t = track("Old");
         cache
-            .store_at(&t, None, Some("words".into()), at(0))
+            .store_at(&t, None, Some("words".into()), Timing::default(), at(0))
             .unwrap();
         let day = 24 * 60 * 60;
         assert!(cache.load_at(&t, at(89 * day)).unwrap().1);
@@ -346,7 +430,9 @@ mod tests {
         let tmp = TempDir::new("clear");
         let cache = Cache::new(tmp.0.clone(), 25).unwrap();
         for title in ["A", "B", "C"] {
-            cache.store(&track(title), None, Some("x".into())).unwrap();
+            cache
+                .store(&track(title), None, Some("x".into()), Timing::default())
+                .unwrap();
         }
         assert_eq!(cache.clear(), 3);
         assert_eq!(cache.stats(), (0, 0));

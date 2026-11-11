@@ -44,8 +44,20 @@ pub enum Status {
     Failed,
 }
 
-// Bài đang được tra và kết quả; luồng lời ghi, luồng giao diện đọc
-static STATE: Mutex<Option<(Track, Status)>> = Mutex::new(None);
+/// Chỉnh thời gian cho lời của một bài
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Timing {
+    /// Lời sớm/muộn bao nhiêu ms so với nhạc (dương = lời hiện muộn hơn)
+    pub offset_ms: i64,
+    /// Bản lời dài khác bài đang phát (vd. video MV có đoạn mở đầu): lời có thể lệch
+    pub approximate: bool,
+}
+
+/// Chỉnh lệch được tối đa ±1 phút (đủ cho đoạn mở đầu của hầu hết video MV)
+pub const MAX_OFFSET_MS: i64 = 60_000;
+
+// Bài đang được tra, kết quả và chỉnh thời gian; luồng lời ghi, luồng giao diện đọc
+static STATE: Mutex<Option<(Track, Status, Timing)>> = Mutex::new(None);
 // Cache dùng chung giữa luồng lời bài hát và menu khay (None = đang tắt)
 static CACHE: OnceLock<Option<Cache>> = OnceLock::new();
 
@@ -56,8 +68,36 @@ fn cache() -> Option<&'static Cache> {
 /// Trạng thái lời nếu đúng là của bài (title, artist), để không hiện lời bài cũ cho bài mới
 pub fn status_for(title: &str, artist: &str) -> Option<Status> {
     let state = STATE.lock().unwrap();
-    let (track, status) = state.as_ref()?;
+    let (track, status, _) = state.as_ref()?;
     (track.title == title && track.artist == artist).then(|| status.clone())
+}
+
+/// Chỉnh thời gian của bài (title, artist); bài khác bài đang tra thì không chỉnh gì
+pub fn timing_for(title: &str, artist: &str) -> Timing {
+    let state = STATE.lock().unwrap();
+    match state.as_ref() {
+        Some((track, _, timing)) if track.title == title && track.artist == artist => *timing,
+        _ => Timing::default(),
+    }
+}
+
+/// Người dùng chỉnh lời sớm/muộn cho bài (title, artist). `save`: ghi luôn xuống đĩa
+/// (lúc đang kéo thanh trượt thì chưa ghi, thả tay mới ghi)
+pub fn set_offset(title: &str, artist: &str, offset_ms: i64, save: bool) {
+    let offset_ms = offset_ms.clamp(-MAX_OFFSET_MS, MAX_OFFSET_MS);
+    let track = {
+        let mut state = STATE.lock().unwrap();
+        match state.as_mut() {
+            Some((track, _, timing)) if track.title == title && track.artist == artist => {
+                timing.offset_ms = offset_ms;
+                track.clone()
+            }
+            _ => return,
+        }
+    };
+    if save && let Some(c) = cache() {
+        let _ = c.set_offset(&track, offset_ms);
+    }
 }
 
 /// Đầu gửi yêu cầu, luồng media giữ để báo bài mới
@@ -68,7 +108,7 @@ pub struct Requester {
 impl Requester {
     pub fn request(&self, track: Track) {
         // Đặt "đang tìm" ngay để giao diện không hiện lời của bài trước
-        *STATE.lock().unwrap() = Some((track.clone(), Status::Loading));
+        *STATE.lock().unwrap() = Some((track.clone(), Status::Loading, Timing::default()));
         let _ = self.tx.send(track);
     }
 }
@@ -112,31 +152,47 @@ fn status_from(synced: Option<&str>, plain: Option<&str>) -> Status {
 }
 
 /// Tìm lời cho một bài: cache còn mới → dùng luôn; không thì hỏi LRCLIB
-fn lookup(session: Option<&Session>, t: &Track) -> Status {
+fn lookup(session: Option<&Session>, t: &Track) -> (Status, Timing) {
     let cached = cache().and_then(|c| c.load(t));
     if let Some((entry, true)) = &cached {
-        return status_from(entry.synced.as_deref(), entry.plain.as_deref());
+        let status = status_from(entry.synced.as_deref(), entry.plain.as_deref());
+        return (status, entry.timing());
     }
+    // Tải lại thì vẫn giữ độ lệch người dùng đã chỉnh trước đó
+    let old_offset = cached.as_ref().map_or(0, |(e, _)| e.offset_ms);
     let fetched = session
         .ok_or_else(|| "không mở được kết nối".to_string())
         .and_then(|s| lrclib::fetch(s, t));
     // Bản cũ (quá 90 ngày) dùng làm phương án dự phòng khi tải lại thất bại
-    let stale = || {
+    let stale = |otherwise: Status| {
         cached
             .as_ref()
-            .map(|(e, _)| status_from(e.synced.as_deref(), e.plain.as_deref()))
+            .map_or((otherwise, Timing::default()), |(e, _)| {
+                (
+                    status_from(e.synced.as_deref(), e.plain.as_deref()),
+                    e.timing(),
+                )
+            })
     };
     match fetched {
-        Ok(Lookup::Lyrics { synced, plain }) => {
+        Ok(Lookup::Lyrics {
+            synced,
+            plain,
+            approximate,
+        }) => {
             let status = status_from(synced.as_deref(), plain.as_deref());
+            let timing = Timing {
+                offset_ms: old_offset,
+                approximate,
+            };
             if let Some(c) = cache() {
-                let _ = c.store(t, synced, plain);
+                let _ = c.store(t, synced, plain, timing);
             }
-            status
+            (status, timing)
         }
-        Ok(Lookup::Instrumental) => Status::Instrumental,
-        Ok(Lookup::NotFound) => stale().unwrap_or(Status::NotFound),
-        Err(_) => stale().unwrap_or(Status::Failed),
+        Ok(Lookup::Instrumental) => (Status::Instrumental, Timing::default()),
+        Ok(Lookup::NotFound) => stale(Status::NotFound),
+        Err(_) => stale(Status::Failed),
     }
 }
 
@@ -149,12 +205,12 @@ fn run(hwnd_raw: isize, rx: Receiver<Track>) {
         while let Ok(newer) = rx.try_recv() {
             track = newer;
         }
-        let status = lookup(session.as_ref(), &track);
+        let (status, timing) = lookup(session.as_ref(), &track);
 
         let mut state = STATE.lock().unwrap();
         // Trong lúc tra, bài có thể đã đổi: chỉ ghi nếu vẫn là bài này
-        if state.as_ref().is_some_and(|(t, _)| *t == track) {
-            *state = Some((track, status));
+        if state.as_ref().is_some_and(|(t, _, _)| *t == track) {
+            *state = Some((track, status, timing));
             drop(state); // nhả khóa trước khi báo cửa sổ
             unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_LYRICS_CHANGED, WPARAM(0), LPARAM(0));
@@ -191,8 +247,13 @@ mod tests {
             album: String::new(),
             duration_s: 0,
         };
-        *STATE.lock().unwrap() = Some((t, Status::NotFound));
+        *STATE.lock().unwrap() = Some((t, Status::NotFound, Timing::default()));
         assert_eq!(status_for("Song A", "Someone"), Some(Status::NotFound));
         assert_eq!(status_for("Song B", "Someone"), None);
+        // Chỉnh lệch: chỉ áp cho đúng bài, và bị giới hạn ±1 phút
+        set_offset("Song A", "Someone", 90_000, false);
+        assert_eq!(timing_for("Song A", "Someone").offset_ms, MAX_OFFSET_MS);
+        set_offset("Song B", "Someone", 5_000, false);
+        assert_eq!(timing_for("Song B", "Someone"), Timing::default());
     }
 }

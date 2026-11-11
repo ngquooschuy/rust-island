@@ -289,10 +289,20 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let (x, y) = mouse_pos(lparam);
             with_app(|app| app.on_click(hwnd, x, y));
         }
-        // Con lăn: nửa cao của wparam là độ lăn (có dấu, ±120 mỗi nấc)
+        WM_LBUTTONUP => {
+            let (x, y) = mouse_pos(lparam);
+            with_app(|app| app.on_mouse_up(hwnd, x, y));
+        }
+        // Con lăn: nửa cao của wparam là độ lăn (có dấu, ±120 mỗi nấc).
+        // Tọa độ chuột ở đây tính theo màn hình, phải đổi về tọa độ trong cửa sổ
         WM_MOUSEWHEEL => {
             let delta = (wparam.0 >> 16) as u16 as i16;
-            with_app(|app| app.on_wheel(hwnd, delta));
+            let (sx, sy) = mouse_pos(lparam);
+            let mut pt = POINT { x: sx, y: sy };
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+            }
+            with_app(|app| app.on_wheel(hwnd, delta, pt.x, pt.y));
         }
         WM_TIMER if wparam.0 == app::TIMER_LYRICS => with_app(|app| app.on_lyrics_tick(hwnd)),
         WM_TIMER if wparam.0 == app::TIMER_ALERT => with_app(|app| app.on_alert_timer(hwnd)),

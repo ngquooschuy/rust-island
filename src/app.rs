@@ -12,7 +12,9 @@ use windows::{
         Foundation::HWND,
         Graphics::Gdi::{CreateRectRgn, SetWindowRgn},
         UI::{
-            Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
+            Input::KeyboardAndMouse::{
+                ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+            },
             WindowsAndMessaging::{KillTimer, SW_HIDE, SW_SHOWNOACTIVATE, SetTimer, ShowWindow},
         },
     },
@@ -27,7 +29,8 @@ use crate::config::{AutoHideConfig, ClockConfig, Config};
 use crate::content::{self, Content, Page};
 use crate::graphics::{AlertView, CompactLyric, Frame, Graphics};
 use crate::icon::Icon;
-use crate::layout::{BUTTON_COUNT, Expanded, LYRICS_BUTTON, Layout};
+use crate::layout::{BUTTON_COUNT, Expanded, LYRICS_BUTTON, Layout, OFFSET_STEP_MS};
+use crate::lyrics;
 use crate::media::{self, MediaCommand};
 use crate::settings;
 
@@ -105,9 +108,11 @@ pub struct App {
     notch: bool,          // đang tự ẩn thành notch? (không bao giờ đúng khi `hovered`)
     last_active: Instant, // lần cuối island được dùng, để đếm giờ tự ẩn
     hover_button: Option<usize>,
-    tracking: bool,                // đã đăng ký nhận WM_MOUSELEAVE chưa?
+    dragging_offset: bool, // đang kéo thanh trượt chỉnh lời (chuột bị "bắt" vào island)
+    offset_pinned: bool,   // vừa chỉnh lời: giữ hàng thanh trượt tới lúc rời chuột
+    tracking: bool,        // đã đăng ký nhận WM_MOUSELEAVE chưa?
     region: Cell<(i32, i32, i32)>, // vùng cửa sổ đang đặt (trái, phải, đáy), khỏi đặt lại
-    hidden: bool,                  // đang ẩn vì có ứng dụng toàn màn hình?
+    hidden: bool,          // đang ẩn vì có ứng dụng toàn màn hình?
     last_frame: Instant,
     commands: Sender<MediaCommand>,
     /// Gửi lần sao chép sang luồng nền (None: tắt hiện nội dung vừa sao chép)
@@ -153,6 +158,8 @@ impl App {
             notch: false,
             last_active: Instant::now(),
             hover_button: None,
+            dragging_offset: false,
+            offset_pinned: false,
             tracking: false,
             region: Cell::new((0, 0, 0)),
             hidden: false,
@@ -224,6 +231,8 @@ impl App {
             hover_button: self.hover_button,
             lyrics_on: self.show_lyrics,
             lyrics_panel: self.lyrics_panel(),
+            offset_row: self.offset_row_timing(),
+            dragging_offset: self.dragging_offset,
             compact_lyric: self.slide.current.as_deref().map(|current| CompactLyric {
                 current,
                 previous: self.slide.previous.as_deref(),
@@ -332,6 +341,7 @@ impl App {
         }
         self.hovered = hovered;
         self.keep_tall = false;
+        self.offset_pinned = false;
         // Rê vào thì hiện lại; rời đi thì về dạng thu gọn rồi mới đếm giờ tự ẩn
         self.notch = false;
         self.last_active = Instant::now();
@@ -346,6 +356,26 @@ impl App {
             || (self.keep_tall && self.content.shows_lyrics_panel(self.page, true))
     }
 
+    /// Hàng thanh trượt chỉnh lời có hiện không, và giá trị của nó. Hiện khi lời có thể lệch,
+    /// khi đã chỉnh khác 0, hoặc khi vừa chỉnh (để hàng không biến mất lúc kéo về 0)
+    fn offset_row_timing(&self) -> Option<lyrics::Timing> {
+        let timing = self.content.timing?;
+        let wanted = timing.approximate || timing.offset_ms != 0 || self.offset_pinned;
+        (self.lyrics_panel() && self.show_lyrics && wanted).then_some(timing)
+    }
+
+    /// Đổi độ lệch lời của bài đang phát; `save`: ghi xuống đĩa luôn
+    fn set_offset(&mut self, hwnd: HWND, offset_ms: i64, save: bool) {
+        let (title, artist) = (
+            self.content.track_title.clone(),
+            self.content.track_artist.clone(),
+        );
+        lyrics::set_offset(&title, &artist, offset_ms, save);
+        self.offset_pinned = true;
+        self.set_content(hwnd, self.fresh_content());
+        self.redraw_if_idle();
+    }
+
     /// Kích thước island nên có theo trạng thái hiện tại
     fn target_size(&self) -> (f32, f32) {
         if self.alert_active() {
@@ -353,7 +383,9 @@ impl App {
             self.layout.alert_size()
         } else if self.hovered {
             // Giữ khung cao sau khi vừa tắt lời, để island không co lại ngay dưới con trỏ
-            let kind = if self.lyrics_panel() {
+            let kind = if self.offset_row_timing().is_some() {
+                Expanded::LyricsAdjust
+            } else if self.lyrics_panel() {
                 Expanded::Lyrics
             } else if self.page == Page::Media && !self.content.title.is_empty() {
                 Expanded::Media
@@ -497,6 +529,15 @@ impl App {
     }
 
     pub fn on_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
+        // Đang kéo thanh trượt: chuột ra ngoài island vẫn kéo tiếp, không thu island lại
+        if self.dragging_offset {
+            let row = self.layout.offset_row(self.height.value);
+            let ms = row.offset_at(x as f32);
+            if self.content.timing.is_some_and(|t| t.offset_ms != ms) {
+                self.set_offset(hwnd, ms, false);
+            }
+            return;
+        }
         if !self.tracking {
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -530,6 +571,9 @@ impl App {
 
     pub fn on_mouse_leave(&mut self, hwnd: HWND) {
         self.tracking = false;
+        if self.dragging_offset {
+            return; // đang kéo: thả chuột rồi mới tính là rời island
+        }
         self.hover_button = None;
         self.set_hovered(hwnd, false);
     }
@@ -541,6 +585,22 @@ impl App {
             return;
         }
         let (x, y) = (x as f32, y as f32);
+        // Hàng thanh trượt chỉnh lời: bấm số giây thì về 0, bấm/kéo trên thanh thì chỉnh
+        if self.hovered && self.offset_row_timing().is_some() {
+            let row = self.layout.offset_row(self.height.value);
+            if row.on_value(x, y) {
+                self.set_offset(hwnd, 0, true);
+                return;
+            }
+            if row.on_track(x, y) {
+                self.dragging_offset = true;
+                unsafe {
+                    SetCapture(hwnd);
+                }
+                self.set_offset(hwnd, row.offset_at(x), false);
+                return;
+            }
+        }
         // Bấm vào hàng chấm phân trang: sang trang kế
         if self
             .layout
@@ -573,13 +633,40 @@ impl App {
     }
 
     /// Lăn chuột trên island: lăn xuống sang trang sau, lăn lên về trang trước
-    pub fn on_wheel(&mut self, hwnd: HWND, delta: i16) {
-        self.wheel += i32::from(delta);
-        if self.wheel.abs() >= WHEEL_NOTCH {
-            let forward = self.wheel < 0;
-            self.wheel = 0;
-            self.set_page(hwnd, self.page.step(forward));
+    /// Thả chuột: kéo thanh trượt xong thì ghi độ lệch xuống đĩa
+    pub fn on_mouse_up(&mut self, hwnd: HWND, x: i32, y: i32) {
+        if !self.dragging_offset {
+            return;
         }
+        self.dragging_offset = false;
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        if let Some(t) = self.content.timing {
+            self.set_offset(hwnd, t.offset_ms, true);
+        }
+        // Thả tay ở ngoài island thì giờ mới tính là rời island
+        self.on_mouse_move(hwnd, x, y);
+    }
+
+    /// Lăn chuột trên island: trên hàng thanh trượt thì chỉnh lời từng nửa giây
+    /// (lăn lên = lời muộn hơn), chỗ khác thì lăn xuống sang trang sau, lăn lên về trang trước
+    pub fn on_wheel(&mut self, hwnd: HWND, delta: i16, x: i32, y: i32) {
+        self.wheel += i32::from(delta);
+        if self.wheel.abs() < WHEEL_NOTCH {
+            return;
+        }
+        let up = self.wheel > 0;
+        self.wheel = 0;
+        if let Some(timing) = self.offset_row_timing().filter(|_| self.hovered) {
+            let row = self.layout.offset_row(self.height.value);
+            if row.contains(x as f32, y as f32) {
+                let step = if up { OFFSET_STEP_MS } else { -OFFSET_STEP_MS };
+                self.set_offset(hwnd, timing.offset_ms + step, true);
+                return;
+            }
+        }
+        self.set_page(hwnd, self.page.step(!up));
     }
 
     /// Gọi mỗi giây: ẩn/hiện theo chế độ toàn màn hình, tự ẩn thành notch, cập nhật đồng hồ

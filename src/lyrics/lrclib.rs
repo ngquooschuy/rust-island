@@ -31,6 +31,8 @@ pub enum Lookup {
     Lyrics {
         synced: Option<String>,
         plain: Option<String>,
+        /// Bản này dài khác bài đang phát (vd. video MV có đoạn mở đầu): lời có thể lệch
+        approximate: bool,
     },
     Instrumental,
     NotFound,
@@ -43,6 +45,10 @@ const MAX_DURATION_DIFF_S: f64 = 3.0;
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Record {
+    #[serde(default)]
+    track_name: String,
+    #[serde(default)]
+    artist_name: String,
     #[serde(default)]
     duration: f64,
     #[serde(default)]
@@ -61,7 +67,11 @@ impl Record {
         let synced = non_empty(self.synced_lyrics);
         let plain = non_empty(self.plain_lyrics);
         if synced.is_some() || plain.is_some() {
-            Lookup::Lyrics { synced, plain }
+            Lookup::Lyrics {
+                synced,
+                plain,
+                approximate: false,
+            }
         } else if self.instrumental {
             Lookup::Instrumental
         } else {
@@ -237,13 +247,56 @@ fn pick_best(records: Vec<Record>, duration_s: u32) -> Lookup {
         .map_or(Lookup::NotFound, Record::into_found)
 }
 
+/// Chuỗi để so tên: chữ thường, chỉ giữ chữ và số ("Sơn Tùng M-TP" → "sơntùngmtp")
+fn name_key(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+/// Video ca nhạc (MV) thường dài hơn bài hát vì có đoạn mở đầu, kết thúc, cảnh phim,
+/// nên không khớp được theo thời lượng. Khi tên bài đoán từ tên video, nhận bản có
+/// cùng tên bài, cùng ca sĩ, và không dài hơn video; đánh dấu là lời có thể lệch
+fn pick_for_video(records: &[Record], title: &str, artist: &str, video_s: u32) -> Lookup {
+    let (title, artist) = (name_key(title), name_key(artist));
+    let video = f64::from(video_s);
+    let same_artist = |r: &Record| {
+        let a = name_key(&r.artist_name);
+        !a.is_empty() && !artist.is_empty() && (a.contains(&artist) || artist.contains(&a))
+    };
+    let best = records
+        .iter()
+        .filter(|r| name_key(&r.track_name) == title && same_artist(r))
+        .filter(|r| video_s == 0 || r.duration <= video + MAX_DURATION_DIFF_S)
+        // Bản đồng bộ trước, rồi bản dài nhất (gần với video nhất)
+        .min_by(|a, b| {
+            a.rank()
+                .cmp(&b.rank())
+                .then(b.duration.total_cmp(&a.duration))
+        });
+    match best.map(|r| r.clone().into_found()) {
+        Some(Lookup::Lyrics { synced, plain, .. }) => Lookup::Lyrics {
+            synced,
+            plain,
+            approximate: true,
+        },
+        other => other.unwrap_or(Lookup::NotFound),
+    }
+}
+
 /// Các câu tìm kiếm, theo thứ tự thử, không trùng nhau
 fn search_queries(t: &Track) -> Vec<String> {
     let artist = first_artist(&t.artist);
+    // Tên kênh YouTube có đuôi riêng ("Hari Won - Topic", "Sơn Tùng M-TP Official"),
+    // LRCLIB thì ghi tên nghệ sĩ trơn: thử tên đã bỏ đuôi trước, rồi tới tên gốc
+    let channel = clean_artist(artist);
     let mut queries = vec![
         // 2) Tên bài + nghệ sĩ đầu tiên
-        format!("{} {artist}", t.title.trim()),
+        format!("{} {channel}", t.title.trim()),
         // 3) Tên bài đã bỏ phần phụ
+        format!("{} {channel}", clean_title(&t.title)),
+        format!("{} {artist}", t.title.trim()),
         format!("{} {artist}", clean_title(&t.title)),
     ];
     // 4) Tên kiểu video YouTube: tên bài + nghệ sĩ đoán được, rồi tên bài một mình
@@ -283,12 +336,20 @@ pub fn fetch(session: &Session, t: &Track) -> Result<Lookup, String> {
         }
     }
 
+    // 2) Tìm kiếm, nhận bản có thời lượng gần đúng
+    let mut seen: Vec<Record> = Vec::new();
     for query in search_queries(t) {
         let body = session.get(&search_url(&query))?.ok()?;
-        let found = pick_best(parse_json(&body)?, t.duration_s);
+        let records: Vec<Record> = parse_json(&body)?;
+        let found = pick_best(records.clone(), t.duration_s);
         if found != Lookup::NotFound {
             return Ok(found);
         }
+        seen.extend(records);
+    }
+    // 3) Video ca nhạc: thời lượng không khớp nhưng đúng tên bài và ca sĩ
+    if let Some((title, artist)) = guess_from_video_title(&t.title, &t.artist) {
+        return Ok(pick_for_video(&seen, &title, &artist, t.duration_s));
     }
     Ok(Lookup::NotFound)
 }
@@ -299,6 +360,8 @@ mod tests {
 
     fn record(duration: f64, synced: Option<&str>, plain: Option<&str>) -> Record {
         Record {
+            track_name: String::new(),
+            artist_name: String::new(),
             duration,
             instrumental: false,
             synced_lyrics: synced.map(String::from),
@@ -307,6 +370,62 @@ mod tests {
     }
 
     /// Gọi LRCLIB thật nên mặc định bỏ qua; chạy bằng `cargo test -- --ignored`
+    /// MV trên YouTube dài hơn bài hát: vẫn phải tìm ra lời nhờ khớp tên bài và ca sĩ
+    #[test]
+    #[ignore]
+    fn live_fetch_finds_lyrics_for_music_video() {
+        let session = Session::open().unwrap();
+        let t = Track {
+            title: "Buông Đôi Tay Nhau Ra | OFFICIAL MUSIC VIDEO | Sơn Tùng M-TP".into(),
+            artist: "Sơn Tùng M-TP Official".into(),
+            album: String::new(),
+            duration_s: 289,
+        };
+        match fetch(&session, &t).unwrap() {
+            Lookup::Lyrics {
+                synced,
+                approximate,
+                ..
+            } => {
+                assert!(
+                    approximate,
+                    "bản lời ngắn hơn video phải được đánh dấu có thể lệch"
+                );
+                let synced = synced.expect("có lời đồng bộ");
+                println!("{}", synced.lines().take(3).collect::<Vec<_>>().join("\n"));
+            }
+            other => panic!("không tìm thấy lời: {other:?}"),
+        }
+    }
+
+    /// Kênh "Topic" của YouTube Music: phải bỏ đuôi " - Topic" mới tìm ra
+    #[test]
+    #[ignore]
+    fn live_fetch_finds_lyrics_for_topic_channel() {
+        let session = Session::open().unwrap();
+        let t = Track {
+            title: "Hương Đêm Bay Xa".into(),
+            artist: "Hari Won - Topic".into(),
+            album: String::new(),
+            duration_s: 222,
+        };
+        match fetch(&session, &t).unwrap() {
+            Lookup::Lyrics {
+                synced,
+                approximate,
+                ..
+            } => {
+                assert!(
+                    !approximate,
+                    "đúng thời lượng thì không phải lời có thể lệch"
+                );
+                let synced = synced.expect("có lời đồng bộ");
+                println!("{}", synced.lines().take(3).collect::<Vec<_>>().join("\n"));
+            }
+            other => panic!("không tìm thấy lời: {other:?}"),
+        }
+    }
+
     #[test]
     #[ignore]
     fn live_fetch_finds_synced_lyrics() {
@@ -339,6 +458,7 @@ mod tests {
             Lookup::Lyrics {
                 synced: Some("[00:01.95] Stranded".into()),
                 plain: Some("Stranded".into()),
+                approximate: false,
             }
         );
     }
@@ -457,6 +577,24 @@ mod tests {
     }
 
     #[test]
+    fn topic_channel_suffix_is_dropped_from_artist() {
+        // Kênh "Topic" của YouTube Music: tên bài gọn sẵn, chỉ tên kênh có đuôi
+        let topic = Track {
+            title: "Hương Đêm Bay Xa".into(),
+            artist: "Hari Won - Topic".into(),
+            album: String::new(),
+            duration_s: 222,
+        };
+        assert_eq!(
+            search_queries(&topic),
+            [
+                "Hương Đêm Bay Xa Hari Won",
+                "Hương Đêm Bay Xa Hari Won - Topic"
+            ]
+        );
+    }
+
+    #[test]
     fn urls_are_encoded() {
         let t = Track {
             title: "Nơi này có anh".into(),
@@ -484,7 +622,75 @@ mod tests {
             Lookup::Lyrics {
                 synced: Some("[00:01.00] b".into()),
                 plain: None,
+                approximate: false,
             }
+        );
+    }
+
+    fn named(track: &str, artist: &str, duration: f64, synced: Option<&str>) -> Record {
+        Record {
+            track_name: track.into(),
+            artist_name: artist.into(),
+            ..record(duration, synced, None)
+        }
+    }
+
+    #[test]
+    fn music_video_matches_by_name_when_duration_differs() {
+        // MV dài 289 giây, bài hát trên LRCLIB chỉ 226–234 giây
+        let records = vec![
+            named(
+                "Như Ngày Hôm Qua",
+                "Sơn Tùng M-TP",
+                221.0,
+                Some("[00:01.00] khác"),
+            ),
+            named("Buông Đôi Tay Nhau Ra", "Sơn Tùng M-TP", 226.0, None),
+            named(
+                "Buông Đôi Tay Nhau Ra",
+                "Sơn Tùng M-TP Official",
+                228.0,
+                Some("[00:01.00] a"),
+            ),
+            named(
+                "Buông Đôi Tay Nhau Ra",
+                "Sơn Tùng M-TP",
+                234.0,
+                Some("[00:01.00] b"),
+            ),
+        ];
+        assert_eq!(pick_best(records.clone(), 289), Lookup::NotFound);
+        let found = pick_for_video(&records, "Buông Đôi Tay Nhau Ra", "Sơn Tùng M-TP", 289);
+        // Bản đồng bộ, dài nhất (gần video nhất), đánh dấu có thể lệch
+        assert_eq!(
+            found,
+            Lookup::Lyrics {
+                synced: Some("[00:01.00] b".into()),
+                plain: None,
+                approximate: true,
+            }
+        );
+    }
+
+    #[test]
+    fn music_video_match_needs_same_title_artist_and_shorter_song() {
+        let r = |track: &str, artist: &str, duration: f64| {
+            vec![named(track, artist, duration, Some("[00:01.00] x"))]
+        };
+        let pick = |records: &[Record]| pick_for_video(records, "Lạc Trôi", "Sơn Tùng M-TP", 280);
+        assert_ne!(
+            pick(&r("LẠC TRÔI", "Sơn Tùng M-TP", 233.0)),
+            Lookup::NotFound
+        );
+        assert_eq!(
+            pick(&r("Lạc Trôi (Remix)", "Sơn Tùng M-TP", 233.0)),
+            Lookup::NotFound
+        );
+        assert_eq!(pick(&r("Lạc Trôi", "Người khác", 233.0)), Lookup::NotFound);
+        // Bài dài hơn cả video thì không phải bản của video này
+        assert_eq!(
+            pick(&r("Lạc Trôi", "Sơn Tùng M-TP", 400.0)),
+            Lookup::NotFound
         );
     }
 
