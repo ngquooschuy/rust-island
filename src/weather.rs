@@ -1,4 +1,4 @@
-//! Thời tiết hiện tại từ Open-Meteo (miễn phí, không cần API key).
+//! Thời tiết hiện tại và dự báo ngày mai từ Open-Meteo (miễn phí, không cần API key).
 //! Chạy trên luồng nền riêng: tìm tọa độ theo tên thành phố một lần,
 //! rồi cứ 15 phút tải lại; báo cho cửa sổ bằng `WM_WEATHER_CHANGED`.
 
@@ -63,6 +63,22 @@ impl Sky {
     }
 }
 
+/// Dự báo cho một ngày
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DayForecast {
+    pub sky: Sky,
+    /// Nhiệt độ cao nhất, thấp nhất trong ngày
+    pub max: f32,
+    pub min: f32,
+}
+
+impl DayForecast {
+    /// "28° / 21°"
+    pub fn range_label(&self) -> String {
+        format!("{} / {}", degrees(self.max), degrees(self.min))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Weather {
     pub temperature: f32,
@@ -71,13 +87,24 @@ pub struct Weather {
     pub is_day: bool,
     /// Tên thành phố do Open-Meteo trả về, ví dụ "Hà Nội"
     pub place: String,
+    /// Nhiệt độ cảm nhận (tính cả gió, độ ẩm); None nếu Open-Meteo không trả về
+    pub feels_like: Option<f32>,
+    /// Độ ẩm, phần trăm
+    pub humidity: Option<u8>,
+    /// Dự báo ngày mai
+    pub tomorrow: Option<DayForecast>,
+}
+
+/// "31°" (đơn vị °C hay °F tùy cấu hình lúc tải)
+pub fn degrees(t: f32) -> String {
+    // + 0.0 biến -0.0 thành 0.0, để không hiện "-0°"
+    format!("{}°", t.round() + 0.0)
 }
 
 impl Weather {
-    /// "31°" (đơn vị °C hay °F tùy cấu hình lúc tải)
+    /// "31°"
     pub fn temperature_label(&self) -> String {
-        // + 0.0 biến -0.0 thành 0.0, để không hiện "-0°"
-        format!("{}°", self.temperature.round() + 0.0)
+        degrees(self.temperature)
     }
 }
 
@@ -102,7 +129,9 @@ fn forecast_url(place: &Place, fahrenheit: bool) -> String {
     let unit = if fahrenheit { "fahrenheit" } else { "celsius" };
     format!(
         "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}\
-         &current=temperature_2m,weather_code,is_day&temperature_unit={unit}",
+         &current=temperature_2m,weather_code,is_day,apparent_temperature,relative_humidity_2m\
+         &daily=weather_code,temperature_2m_max,temperature_2m_min&forecast_days=2\
+         &timezone=auto&temperature_unit={unit}",
         place.latitude, place.longitude
     )
 }
@@ -123,6 +152,9 @@ struct Place {
 #[derive(Deserialize)]
 struct ForecastResponse {
     current: Current,
+    /// Mỗi trường là một mảng, phần tử 0 là hôm nay, 1 là ngày mai
+    #[serde(default)]
+    daily: Option<Daily>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +162,31 @@ struct Current {
     temperature_2m: f32,
     weather_code: u16,
     is_day: u8,
+    #[serde(default)]
+    apparent_temperature: Option<f32>,
+    #[serde(default)]
+    relative_humidity_2m: Option<f32>,
+}
+
+#[derive(Deserialize, Default)]
+struct Daily {
+    #[serde(default)]
+    weather_code: Vec<Option<u16>>,
+    #[serde(default)]
+    temperature_2m_max: Vec<Option<f32>>,
+    #[serde(default)]
+    temperature_2m_min: Vec<Option<f32>>,
+}
+
+impl Daily {
+    /// Dự báo của ngày thứ `i` (0 = hôm nay); thiếu số liệu thì None
+    fn day(&self, i: usize) -> Option<DayForecast> {
+        Some(DayForecast {
+            sky: Sky::from_wmo((*self.weather_code.get(i)?)?),
+            max: (*self.temperature_2m_max.get(i)?)?,
+            min: (*self.temperature_2m_min.get(i)?)?,
+        })
+    }
 }
 
 fn parse_place(json: &str) -> Result<Place, String> {
@@ -149,6 +206,11 @@ fn parse_weather(json: &str, place: &Place) -> Result<Weather, String> {
         sky: Sky::from_wmo(c.weather_code),
         is_day: c.is_day == 1,
         place: place.name.clone(),
+        feels_like: c.apparent_temperature,
+        humidity: c
+            .relative_humidity_2m
+            .map(|h| h.round().clamp(0.0, 100.0) as u8),
+        tomorrow: response.daily.and_then(|d| d.day(1)),
     })
 }
 
@@ -189,6 +251,13 @@ fn fake() -> Option<Weather> {
         sky: Sky::from_wmo(code),
         is_day: parts.next().map(str::trim) != Some("n"),
         place: "Thử nghiệm".into(),
+        feels_like: Some(temperature + 3.0),
+        humidity: Some(42),
+        tomorrow: Some(DayForecast {
+            sky: Sky::Rain,
+            max: temperature + 1.0,
+            min: temperature - 6.0,
+        }),
     })
 }
 
@@ -224,7 +293,12 @@ mod tests {
         "longitude":105.84117,"country":"Việt Nam"}],"generationtime_ms":0.24}"#;
     const FORECAST_JSON: &str = r#"{"latitude":21.05,"current_units":{"temperature_2m":"°C"},
         "current":{"time":"2026-11-09T23:45","interval":900,"temperature_2m":16.9,
-        "weather_code":3,"is_day":0}}"#;
+        "weather_code":3,"is_day":0,"apparent_temperature":15.2,"relative_humidity_2m":81},
+        "daily":{"time":["2026-11-09","2026-11-10"],"weather_code":[3,61],
+        "temperature_2m_max":[24.1,22.6],"temperature_2m_min":[16.0,17.4]}}"#;
+    /// Bản trả về cũ (chỉ có thời tiết hiện tại) vẫn đọc được
+    const CURRENT_ONLY_JSON: &str = r#"{"current":{"temperature_2m":30.0,"weather_code":0,
+        "is_day":1}}"#;
 
     fn hanoi() -> Place {
         parse_place(GEO_JSON).unwrap()
@@ -263,10 +337,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_feels_like_humidity_and_tomorrow() {
+        let w = parse_weather(FORECAST_JSON, &hanoi()).unwrap();
+        assert_eq!(w.feels_like, Some(15.2));
+        assert_eq!(w.humidity, Some(81));
+        let tomorrow = w.tomorrow.unwrap();
+        assert_eq!(tomorrow.sky, Sky::Rain);
+        assert_eq!(tomorrow.range_label(), "23° / 17°");
+
+        let old = parse_weather(CURRENT_ONLY_JSON, &hanoi()).unwrap();
+        assert_eq!(
+            (old.feels_like, old.humidity, old.tomorrow),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn missing_forecast_values_give_no_tomorrow() {
+        let json = r#"{"current":{"temperature_2m":30.0,"weather_code":0,"is_day":1},
+            "daily":{"weather_code":[0,null],"temperature_2m_max":[31.0,30.0],
+            "temperature_2m_min":[25.0,24.0]}}"#;
+        assert_eq!(parse_weather(json, &hanoi()).unwrap().tomorrow, None);
+    }
+
+    #[test]
     fn forecast_url_has_coordinates_and_unit() {
         let url = forecast_url(&hanoi(), true);
         assert!(url.contains("latitude=21.0245&longitude=105.84117"));
         assert!(url.contains("temperature_unit=fahrenheit"));
+        assert!(url.contains("apparent_temperature,relative_humidity_2m"));
+        assert!(url.contains("&daily=weather_code,temperature_2m_max,temperature_2m_min"));
+        assert!(url.contains("&forecast_days=2"));
     }
 
     #[test]

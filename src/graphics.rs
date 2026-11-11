@@ -24,10 +24,13 @@ use crate::battery::Battery;
 use crate::config::{BackdropKind, Color, Config};
 use crate::content::{self, Content, LyricsView, Page, Progress};
 use crate::icon::Icon;
-use crate::layout::{LYRICS_BUTTON, Layout, PLAYER_COVER, PLAYER_COVER_TOP, PLAYER_PAD};
+use crate::layout::{
+    Expanded, LYRICS_BUTTON, Layout, PLAYER_COVER, PLAYER_COVER_TOP, PLAYER_PAD, WEATHER_CARD_GAP,
+    WEATHER_CARD_H, WEATHER_CARDS_TOP,
+};
 use crate::meter::{WAVE_BARS, Wave};
 use crate::palette;
-use crate::weather::{Sky, Weather};
+use crate::weather::{self, Sky, Weather};
 
 /// Màu cố định cho trạng thái pin (theo màu hệ thống của Apple)
 const CHARGING_GREEN: Color = Color::rgb(0x30, 0xD1, 0x58);
@@ -119,6 +122,10 @@ const WAVE_MAX_H: f32 = 34.0;
 const BADGE_R: f32 = 12.0;
 const BADGE_BG: Color = Color::rgb(0x16, 0x16, 0x18);
 
+/// Trang Thời tiết: độ đậm nền thẻ (màu chữ phủ mờ lên nền island) và biểu tượng trong thẻ
+const CARD_BG: f32 = 0.06;
+const CARD_ICON_OPACITY: f32 = 0.8;
+
 /// Hạt nhiễu của nền Acrylic: ô vuông cạnh bao nhiêu điểm ảnh (lát lặp lại), và độ đậm
 const NOISE_SIZE: u32 = 128;
 const NOISE_OPACITY: f32 = 0.035;
@@ -148,6 +155,8 @@ pub struct Graphics {
     fmt_alert_app: IDWriteTextFormat,
     /// Tên bài lớn, căn trái (trang Media không có khung lời)
     fmt_media_title: IDWriteTextFormat,
+    /// Nhiệt độ lớn, căn trái (trang Thời tiết)
+    fmt_temp: IDWriteTextFormat,
     fmt_alert_title: IDWriteTextFormat,
     fmt_alert_body: IDWriteTextFormat,
     /// Biểu tượng dạng chữ của Windows (Segoe MDL2 Assets) khi app không có biểu tượng
@@ -381,6 +390,12 @@ impl Graphics {
                 18.0,
                 DWRITE_FONT_WEIGHT_SEMI_BOLD,
             )?)?;
+            let fmt_temp = left_aligned(make_format(
+                &dwrite,
+                &family,
+                46.0,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            )?)?;
             let fmt_alert_title = left_aligned(make_format(
                 &dwrite,
                 &family,
@@ -423,6 +438,7 @@ impl Graphics {
                 fmt_tiny,
                 fmt_alert_app,
                 fmt_media_title,
+                fmt_temp,
                 fmt_alert_title,
                 fmt_alert_body,
                 fmt_symbol,
@@ -642,13 +658,16 @@ impl Graphics {
         };
         if alpha_small > 0.0 {
             match page {
-                Page::Idle => self.draw_idle_compact(content, left, w, h, alpha_small),
+                Page::Idle | Page::Weather => {
+                    self.draw_idle_compact(content, left, w, h, alpha_small)
+                }
                 Page::Media | Page::Player => self.draw_media_compact(frame, left, alpha_small),
             }
         }
         if alpha_big > 0.0 {
             match page {
                 Page::Idle => self.draw_idle_full(content, alpha_big),
+                Page::Weather => self.draw_weather_full(content, alpha_big),
                 Page::Media => self.draw_media_full(frame, alpha_big),
                 Page::Player => self.draw_player_full(frame, alpha_big),
             }
@@ -773,10 +792,11 @@ impl Graphics {
     }
 
     fn dot_row(&self, page: Page, (cx, cy): (f32, f32), vertical: bool, alpha: f32) {
-        let n = Page::ALL.len() as f32;
+        let pages = Page::list(self.weather_enabled);
+        let n = pages.len() as f32;
         let total = DOT_ACTIVE_W + (n - 1.0) * (DOT + DOT_GAP);
         let mut pos = if vertical { cy } else { cx } - total / 2.0;
-        for p in Page::ALL {
+        for &p in pages {
             let (len, color, opacity) = if p == page {
                 (DOT_ACTIVE_W, self.text, 0.9)
             } else {
@@ -989,6 +1009,9 @@ impl Graphics {
                 sky: Sky::Cloudy,
                 is_day: true,
                 place: String::new(),
+                feels_like: None,
+                humidity: None,
+                tomorrow: None,
             };
             let (w, label, color, opacity) = match &content.weather {
                 Some(w) => (w, w.temperature_label(), self.accent, 1.0),
@@ -1086,6 +1109,138 @@ impl Graphics {
             &self.fmt_date,
             rect(el, 66.0, right, 92.0),
         );
+    }
+
+    // ---------- Trang Thời tiết ----------
+
+    /// Trang Thời tiết mở rộng:
+    ///   Hà Nội                │  [mây]  Ngày mai · Mưa
+    ///   [biểu tượng] 31°      │         23° / 17°
+    ///                         │  [nhiệt kế] Cảm giác như
+    ///   Có mây                │         34°
+    ///                         │  [giọt nước] Độ ẩm
+    ///                         │         42%
+    fn draw_weather_full(&self, content: &Content, alpha: f32) {
+        let (el, right) = self.expanded_edges();
+        let Some(w) = &content.weather else {
+            self.set_brush(self.secondary, alpha);
+            self.draw_text(
+                "Đang tải thời tiết…",
+                &self.fmt_date,
+                rect(el, 10.0, right, 92.0),
+            );
+            return;
+        };
+        let h = self.layout.expanded_size(Expanded::Weather).1;
+        let mid = el + (right - el) * 0.5;
+        let x = el + 30.0;
+
+        // Bên trái: thành phố, biểu tượng + nhiệt độ lớn, mô tả
+        self.set_brush(self.secondary, alpha);
+        self.draw_text(
+            &w.place,
+            &self.fmt_alert_body,
+            rect(x, 24.0, mid - 12.0, 44.0),
+        );
+        let cy = 88.0;
+        let scale = 1.9;
+        let icon_w = WEATHER_ICON.0 * scale;
+        self.draw_weather_icon(x, cy, scale, w.sky, w.is_day, self.accent, alpha);
+        self.set_brush(self.text, alpha);
+        let tx = x + icon_w + 6.0;
+        self.draw_text(
+            &w.temperature_label(),
+            &self.fmt_temp,
+            rect(tx, cy - 30.0, mid - 8.0, cy + 30.0),
+        );
+        let (sky, f) = self.fit_text(w.sky.describe(), &[&self.fmt_alert_title], mid - 12.0 - x);
+        self.draw_text(&sky, f, rect(x, 128.0, mid - 12.0, 152.0));
+
+        self.draw_divider(mid, h / 2.0, h / 2.0 - 26.0, alpha);
+
+        // Bên phải: ba thẻ
+        let (cx0, cx1) = (mid + 18.0, right - 34.0);
+        let card = |i: usize| {
+            let top = WEATHER_CARDS_TOP + i as f32 * (WEATHER_CARD_H + WEATHER_CARD_GAP);
+            rect(cx0, top, cx1, top + WEATHER_CARD_H)
+        };
+        let dash = || "--".to_string();
+
+        let tomorrow_label = w.tomorrow.map_or_else(
+            || "Ngày mai".to_string(),
+            |t| format!("Ngày mai · {}", t.sky.describe()),
+        );
+        let tomorrow_value = w.tomorrow.map_or_else(dash, |t| t.range_label());
+        self.draw_weather_card(
+            card(0),
+            &tomorrow_label,
+            &tomorrow_value,
+            alpha,
+            |ix, iy| {
+                let sky = w.tomorrow.map_or(Sky::Cloudy, |t| t.sky);
+                let s = 0.62;
+                self.draw_weather_icon(
+                    ix - WEATHER_ICON.0 * s / 2.0,
+                    iy,
+                    s,
+                    sky,
+                    true,
+                    self.accent,
+                    alpha * CARD_ICON_OPACITY,
+                );
+            },
+        );
+
+        let feels = w.feels_like.map_or_else(dash, weather::degrees);
+        self.draw_weather_card(card(1), "Cảm giác như", &feels, alpha, |ix, iy| {
+            self.thermometer(ix, iy, alpha * CARD_ICON_OPACITY);
+        });
+
+        let humidity = w.humidity.map_or_else(dash, |h| format!("{h}%"));
+        self.draw_weather_card(card(2), "Độ ẩm", &humidity, alpha, |ix, iy| {
+            self.droplet(ix, iy, alpha * CARD_ICON_OPACITY);
+        });
+    }
+
+    /// Một thẻ: nền mờ bo góc, biểu tượng bên trái, nhãn nhỏ ở trên, số liệu đậm ở dưới.
+    /// `draw_icon(x, y)` vẽ biểu tượng có tâm (x, y)
+    fn draw_weather_card(
+        &self,
+        r: D2D_RECT_F,
+        label: &str,
+        value: &str,
+        alpha: f32,
+        draw_icon: impl Fn(f32, f32),
+    ) {
+        self.set_brush(self.text, alpha * CARD_BG);
+        self.fill(rounded(r, 12.0));
+        draw_icon(r.left + 20.0, r.top + 15.0);
+        let x = r.left + 38.0;
+        let max_w = r.right - 8.0 - x;
+        let (label, f) = self.fit_text(label, &[&self.fmt_alert_app], max_w);
+        self.set_brush(self.secondary, alpha);
+        self.draw_text(&label, f, rect(x, r.top + 6.0, r.right - 8.0, r.top + 23.0));
+        let (value, f) = self.fit_text(value, &[&self.fmt_alert_title], max_w);
+        self.set_brush(self.text, alpha);
+        self.draw_text(
+            &value,
+            f,
+            rect(x, r.top + 22.0, r.right - 8.0, r.top + 42.0),
+        );
+    }
+
+    /// Nhiệt kế nhỏ, tâm (cx, cy)
+    fn thermometer(&self, cx: f32, cy: f32, alpha: f32) {
+        self.set_brush(self.accent, alpha);
+        self.fill(rounded(rect(cx - 1.8, cy - 8.0, cx + 1.8, cy + 3.0), 1.8));
+        self.circle(cx, cy + 4.5, 3.6);
+    }
+
+    /// Giọt nước nhỏ, tâm (cx, cy): tam giác nhọn ở trên, tròn ở dưới
+    fn droplet(&self, cx: f32, cy: f32, alpha: f32) {
+        self.set_brush(self.accent, alpha);
+        self.triangle([(cx, cy - 8.0), (cx - 4.4, cy + 1.5), (cx + 4.4, cy + 1.5)]);
+        self.circle(cx, cy + 2.6, 4.6);
     }
 
     // ---------- Trang Media ----------

@@ -15,6 +15,12 @@ const MEDIA_H: f32 = 160.0;
 const LYRICS_H: f32 = 248.0;
 /// Trang Media Player: ảnh bìa lớn, tên bài, sóng nhạc, thanh tiến độ, hàng nút
 const PLAYER_H: f32 = 208.0;
+/// Trang Thời tiết: nhiệt độ lớn bên trái, ba thẻ (ngày mai, cảm giác như, độ ẩm) bên phải
+const WEATHER_H: f32 = 184.0;
+/// Thẻ bên phải trang Thời tiết: cao, khoảng cách giữa hai thẻ, mép trên thẻ đầu
+pub const WEATHER_CARD_H: f32 = 46.0;
+pub const WEATHER_CARD_GAP: f32 = 7.0;
+pub const WEATHER_CARDS_TOP: f32 = 19.0;
 /// Thông báo tạm thời (vừa sao chép, thông báo Windows): đủ cao cho biểu tượng và 3 dòng chữ
 const ALERT_H: f32 = 84.0;
 /// Island khi tự ẩn: chỉ còn một vạch nhỏ (notch)
@@ -69,6 +75,8 @@ pub enum Expanded {
     Lyrics,
     /// Trang Media Player có bài đang phát
     Player,
+    /// Trang Thời tiết đã có số liệu
+    Weather,
 }
 
 /// `Copy` vì chỉ chứa vài con số: truyền đi đâu cũng sao chép, không cần mượn
@@ -90,7 +98,12 @@ impl Layout {
     pub fn new(window: &WindowConfig) -> Self {
         Self {
             win_w: (window.expanded_width + MARGIN_X).ceil() as i32,
-            win_h: (EXPANDED_H.max(MEDIA_H).max(LYRICS_H).max(PLAYER_H) + MARGIN_Y) as i32,
+            win_h: (EXPANDED_H
+                .max(MEDIA_H)
+                .max(LYRICS_H)
+                .max(PLAYER_H)
+                .max(WEATHER_H)
+                + MARGIN_Y) as i32,
             top: window.top,
             collapsed: (window.collapsed_width, COLLAPSED_H),
             expanded: (window.expanded_width, EXPANDED_H),
@@ -134,6 +147,7 @@ impl Layout {
             Expanded::Media => MEDIA_H,
             Expanded::Lyrics => LYRICS_H,
             Expanded::Player => PLAYER_H,
+            Expanded::Weather => WEATHER_H,
         };
         (self.expanded.0, h)
     }
@@ -228,11 +242,12 @@ impl Layout {
 mod tests {
     use super::*;
 
-    const KINDS: [Expanded; 4] = [
+    const KINDS: [Expanded; 5] = [
         Expanded::Plain,
         Expanded::Media,
         Expanded::Lyrics,
         Expanded::Player,
+        Expanded::Weather,
     ];
 
     fn layout() -> Layout {
@@ -366,6 +381,15 @@ mod tests {
             let (dots_x, _) = l.dots_center(w, h);
             assert!(x1 + 40.0 < dots_x);
         }
+    }
+
+    #[test]
+    fn weather_cards_fit_inside_the_island() {
+        let l = layout();
+        let (_, h) = l.expanded_size(Expanded::Weather);
+        let bottom = WEATHER_CARDS_TOP + 3.0 * WEATHER_CARD_H + 2.0 * WEATHER_CARD_GAP;
+        assert!(bottom + 12.0 <= h, "thẻ cuối chạm đáy island");
+        assert!(h <= l.win_h as f32);
     }
 
     #[test]

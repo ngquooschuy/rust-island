@@ -146,6 +146,8 @@ impl Content {
 pub enum Page {
     /// Đồng hồ + thời tiết
     Idle,
+    /// Thời tiết chi tiết: nhiệt độ lớn, ngày mai, cảm giác như, độ ẩm
+    Weather,
     /// Bài đang phát + nút điều khiển (+ lời bài hát)
     Media,
     /// Trình phát nhạc: ảnh bìa lớn, sóng nhạc, tua được; màu nhấn theo ảnh bìa
@@ -154,26 +156,32 @@ pub enum Page {
 
 impl Page {
     /// Thứ tự khi lăn chuột xuống
-    pub const ALL: [Page; 3] = [Page::Idle, Page::Media, Page::Player];
+    pub const ALL: [Page; 4] = [Page::Idle, Page::Weather, Page::Media, Page::Player];
+    /// Khi tắt thời tiết trong Cài đặt: không có trang Thời tiết
+    const WITHOUT_WEATHER: [Page; 3] = [Page::Idle, Page::Media, Page::Player];
+
+    /// Các trang đang có, theo thứ tự
+    pub fn list(weather: bool) -> &'static [Page] {
+        if weather {
+            &Self::ALL
+        } else {
+            &Self::WITHOUT_WEATHER
+        }
+    }
 
     /// Trang về nhạc (Media, Media Player): có bài đang phát thì có nút điều khiển
     pub fn is_music(self) -> bool {
         matches!(self, Page::Media | Page::Player)
     }
 
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|&p| p == self).unwrap()
-    }
-
-    /// Trang kế tiếp (`forward`) hoặc trước đó, quay vòng
-    pub fn step(self, forward: bool) -> Self {
-        let n = Self::ALL.len();
-        let i = if forward {
-            self.index() + 1
-        } else {
-            self.index() + n - 1
-        };
-        Self::ALL[i % n]
+    /// Trang kế tiếp (`forward`) hoặc trước đó, quay vòng; `weather`: có trang Thời tiết không
+    pub fn step(self, forward: bool, weather: bool) -> Self {
+        let pages = Self::list(weather);
+        let n = pages.len();
+        // Trang hiện tại không có trong danh sách (vừa tắt thời tiết): coi như đang ở đầu
+        let at = pages.iter().position(|&p| p == self).unwrap_or(0);
+        let i = if forward { at + 1 } else { at + n - 1 };
+        pages[i % n]
     }
 
     /// Trang lúc mới mở app
@@ -520,6 +528,9 @@ mod tests {
                 sky: crate::weather::Sky::PartlyCloudy,
                 is_day: true,
                 place: "Hà Nội".into(),
+                feels_like: None,
+                humidity: None,
+                tomorrow: None,
             }),
             battery: Some(Battery {
                 percent: 82,
@@ -554,12 +565,23 @@ mod tests {
 
     #[test]
     fn page_step_wraps_around_both_ways() {
-        // Lăn xuống: Idle → Media → Media Player → Idle
-        assert_eq!(Page::Idle.step(true), Page::Media);
-        assert_eq!(Page::Media.step(true), Page::Player);
-        assert_eq!(Page::Player.step(true), Page::Idle);
-        assert_eq!(Page::Idle.step(false), Page::Player);
-        assert_eq!(Page::Player.step(false), Page::Media);
+        // Lăn xuống: Idle → Thời tiết → Media → Media Player → Idle
+        assert_eq!(Page::Idle.step(true, true), Page::Weather);
+        assert_eq!(Page::Weather.step(true, true), Page::Media);
+        assert_eq!(Page::Media.step(true, true), Page::Player);
+        assert_eq!(Page::Player.step(true, true), Page::Idle);
+        assert_eq!(Page::Idle.step(false, true), Page::Player);
+        assert_eq!(Page::Media.step(false, true), Page::Weather);
+    }
+
+    #[test]
+    fn weather_page_is_skipped_when_weather_is_off() {
+        assert_eq!(Page::Idle.step(true, false), Page::Media);
+        assert_eq!(Page::Media.step(false, false), Page::Idle);
+        assert_eq!(Page::list(false).len(), 3);
+        // Đang ở trang Thời tiết thì vừa tắt: lăn tiếp ra trang khác, không kẹt lại
+        assert_eq!(Page::Weather.step(true, false), Page::Media);
+        assert!(!Page::Weather.is_music());
     }
 
     #[test]

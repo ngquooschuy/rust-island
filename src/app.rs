@@ -94,6 +94,7 @@ pub struct App {
     clock: ClockConfig,
     autohide: AutoHideConfig,
     lyrics_enabled: bool,    // bật lời bài hát trong cấu hình?
+    weather_enabled: bool,   // bật thời tiết trong cấu hình? (tắt thì không có trang Thời tiết)
     show_lyrics: bool,       // đang hiện lời? (nút bên phải hàng nút bật/tắt)
     lyrics_collapsed: bool,  // hiện câu đang hát trên island thu gọn? (menu chuột phải)
     slide: LineSlide,        // câu đang hiện trên island thu gọn, có hiệu ứng trượt
@@ -148,6 +149,7 @@ impl App {
             clock: config.clock,
             autohide: config.autohide,
             lyrics_enabled,
+            weather_enabled: config.weather.enabled,
             show_lyrics: lyrics_enabled && config.lyrics.show,
             lyrics_collapsed: lyrics_enabled && config.lyrics.collapsed,
             slide: LineSlide::default(),
@@ -383,6 +385,8 @@ impl App {
                 Expanded::Media
             } else if self.page == Page::Player && !self.content.title.is_empty() {
                 Expanded::Player
+            } else if self.page == Page::Weather && self.content.weather.is_some() {
+                Expanded::Weather
             } else {
                 Expanded::Plain
             };
@@ -592,7 +596,7 @@ impl App {
             .layout
             .dots_hit(self.width.value, self.height.value, x, y)
         {
-            self.set_page(hwnd, self.page.step(true));
+            self.set_page(hwnd, self.page.step(true, self.weather_enabled));
             return;
         }
         if !self.buttons_active() {
@@ -632,7 +636,7 @@ impl App {
         if self.wheel.abs() >= WHEEL_NOTCH {
             let forward = self.wheel < 0;
             self.wheel = 0;
-            self.set_page(hwnd, self.page.step(forward));
+            self.set_page(hwnd, self.page.step(forward, self.weather_enabled));
         }
     }
 
