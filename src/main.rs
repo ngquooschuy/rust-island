@@ -174,6 +174,8 @@ fn create_window(layout: &Layout, owner: Option<HWND>) -> Result<HWND> {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance.into(),
+            hIcon: crate::icon::app_icon(false),
+            hIconSm: crate::icon::app_icon(true),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             lpszClassName: class_name,
             ..Default::default()

@@ -18,11 +18,41 @@ use windows::{
             WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO},
         },
     },
-    core::{HSTRING, w},
+    core::{HSTRING, PCWSTR, w},
 };
 
 /// Kích thước biểu tượng lấy ra
 pub const ICON_SIZE: u32 = 64;
+
+/// Mã icon của app trong file .exe (assets/app.rc)
+const APP_ICON_ID: usize = 1;
+
+/// Icon của chính app (con mèo trong assets/icon.ico), đúng cỡ theo DPI màn hình:
+/// `small` cho khay hệ thống và góc cửa sổ, không thì cỡ lớn (Alt+Tab, taskbar).
+/// Bản build thiếu icon (máy không có rc.exe) thì dùng icon mặc định của Windows
+pub fn app_icon(small: bool) -> HICON {
+    use windows::Win32::{
+        System::LibraryLoader::GetModuleHandleW,
+        UI::{
+            Controls::{LIM_LARGE, LIM_SMALL, LoadIconMetric},
+            WindowsAndMessaging::{IDI_APPLICATION, LoadIconW},
+        },
+    };
+    let metric = if small { LIM_SMALL } else { LIM_LARGE };
+    unsafe {
+        GetModuleHandleW(None)
+            .and_then(|module| {
+                // MAKEINTRESOURCE: mã số đặt vào chỗ con trỏ tên
+                LoadIconMetric(
+                    Some(module.into()),
+                    PCWSTR(APP_ICON_ID as *const u16),
+                    metric,
+                )
+            })
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+            .unwrap_or_default()
+    }
+}
 
 /// Ảnh nhỏ: biểu tượng app hoặc ảnh thu nhỏ của ảnh vừa sao chép
 #[derive(Clone, Debug, PartialEq)]

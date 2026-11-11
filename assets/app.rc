@@ -1,0 +1,4 @@
+// Tài nguyên nhúng vào file .exe (build.rs biên dịch bằng rc.exe của Windows SDK).
+// Mã 1 là icon của app: Explorer, taskbar, khay hệ thống và cửa sổ Cài đặt đều dùng nó
+// (xem icon::app_icon). Icon đầu tiên trong file .exe cũng là icon Explorer hiển thị.
+1 ICON "icon.ico"

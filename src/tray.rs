@@ -37,7 +37,7 @@ pub fn add(hwnd: HWND) -> Result<()> {
             uID: TRAY_ID,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: LoadIconW(None, IDI_APPLICATION)?, // icon mặc định của Windows
+            hIcon: crate::icon::app_icon(true),
             ..Default::default()
         };
         // szTip là mảng 128 số u16 cố định: chép chuỗi UTF-16 vào đầu mảng
