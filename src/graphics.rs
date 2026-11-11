@@ -1114,8 +1114,8 @@ impl Graphics {
     // ---------- Trang Thời tiết ----------
 
     /// Trang Thời tiết mở rộng:
-    ///   Hà Nội                │  [mây]  Ngày mai · Mưa
-    ///   [biểu tượng] 31°      │         23° / 17°
+    ///   Hà Nội                │  [mây]  Ngày mai
+    ///   [biểu tượng] 31°      │         60% khả năng có mưa
     ///                         │  [nhiệt kế] Cảm giác như
     ///   Có mây                │         34°
     ///                         │  [giọt nước] Độ ẩm
@@ -1132,7 +1132,8 @@ impl Graphics {
             return;
         };
         let h = self.layout.expanded_size(Expanded::Weather).1;
-        let mid = el + (right - el) * 0.5;
+        // Đường chia lệch trái một chút: thẻ bên phải đủ rộng cho "60% khả năng có mưa"
+        let mid = el + (right - el) * 0.44;
         let x = el + 30.0;
 
         // Bên trái: thành phố, biểu tượng + nhiệt độ lớn, mô tả
@@ -1159,56 +1160,55 @@ impl Graphics {
         self.draw_divider(mid, h / 2.0, h / 2.0 - 26.0, alpha);
 
         // Bên phải: ba thẻ
-        let (cx0, cx1) = (mid + 18.0, right - 34.0);
+        let (cx0, cx1) = (mid + 14.0, right - 30.0);
         let card = |i: usize| {
             let top = WEATHER_CARDS_TOP + i as f32 * (WEATHER_CARD_H + WEATHER_CARD_GAP);
             rect(cx0, top, cx1, top + WEATHER_CARD_H)
         };
         let dash = || "--".to_string();
 
-        let tomorrow_label = w.tomorrow.map_or_else(
-            || "Ngày mai".to_string(),
-            |t| format!("Ngày mai · {}", t.sky.describe()),
-        );
-        let tomorrow_value = w.tomorrow.map_or_else(dash, |t| t.range_label());
-        self.draw_weather_card(
-            card(0),
-            &tomorrow_label,
-            &tomorrow_value,
-            alpha,
-            |ix, iy| {
-                let sky = w.tomorrow.map_or(Sky::Cloudy, |t| t.sky);
-                let s = 0.62;
-                self.draw_weather_icon(
-                    ix - WEATHER_ICON.0 * s / 2.0,
-                    iy,
-                    s,
-                    sky,
-                    true,
-                    self.accent,
-                    alpha * CARD_ICON_OPACITY,
-                );
-            },
-        );
+        let rain = w.tomorrow.map_or_else(dash, |t| t.rain_label());
+        // Có số liệu thì nối thêm chữ nhỏ; thẻ hẹp thì dùng bản ngắn
+        let note: &[&str] = if w.tomorrow.is_some_and(|t| t.rain_chance.is_some()) {
+            &[" khả năng có mưa", " có mưa"]
+        } else {
+            &[]
+        };
+        self.draw_weather_card(card(0), "Ngày mai", &rain, note, alpha, |ix, iy| {
+            let sky = w.tomorrow.map_or(Sky::Cloudy, |t| t.sky);
+            let s = 0.62;
+            self.draw_weather_icon(
+                ix - WEATHER_ICON.0 * s / 2.0,
+                iy,
+                s,
+                sky,
+                true,
+                self.accent,
+                alpha * CARD_ICON_OPACITY,
+            );
+        });
 
         let feels = w.feels_like.map_or_else(dash, weather::degrees);
-        self.draw_weather_card(card(1), "Cảm giác như", &feels, alpha, |ix, iy| {
+        self.draw_weather_card(card(1), "Cảm giác như", &feels, &[], alpha, |ix, iy| {
             self.thermometer(ix, iy, alpha * CARD_ICON_OPACITY);
         });
 
         let humidity = w.humidity.map_or_else(dash, |h| format!("{h}%"));
-        self.draw_weather_card(card(2), "Độ ẩm", &humidity, alpha, |ix, iy| {
+        self.draw_weather_card(card(2), "Độ ẩm", &humidity, &[], alpha, |ix, iy| {
             self.droplet(ix, iy, alpha * CARD_ICON_OPACITY);
         });
     }
 
     /// Một thẻ: nền mờ bo góc, biểu tượng bên trái, nhãn nhỏ ở trên, số liệu đậm ở dưới.
-    /// `draw_icon(x, y)` vẽ biểu tượng có tâm (x, y)
+    /// `note`: chữ nhỏ nối sau số liệu, thử lần lượt từng bản, lấy bản đầu tiên vừa chỗ
+    /// (không bản nào vừa thì bỏ). `draw_icon(x, y)` vẽ biểu tượng có tâm (x, y)
+    #[allow(clippy::too_many_arguments)]
     fn draw_weather_card(
         &self,
         r: D2D_RECT_F,
         label: &str,
         value: &str,
+        note: &[&str],
         alpha: f32,
         draw_icon: impl Fn(f32, f32),
     ) {
@@ -1222,11 +1222,23 @@ impl Graphics {
         self.draw_text(&label, f, rect(x, r.top + 6.0, r.right - 8.0, r.top + 23.0));
         let (value, f) = self.fit_text(value, &[&self.fmt_alert_title], max_w);
         self.set_brush(self.text, alpha);
-        self.draw_text(
-            &value,
-            f,
-            rect(x, r.top + 22.0, r.right - 8.0, r.top + 42.0),
-        );
+        let (top, bottom) = (r.top + 22.0, r.top + 42.0);
+        self.draw_text(&value, f, rect(x, top, r.right - 8.0, bottom));
+        let value_w = self.text_width(&value, f);
+        let room = max_w - value_w;
+        let fits = note
+            .iter()
+            .find(|n| self.text_width(n, &self.fmt_alert_app) <= room);
+        if let Some(note) = fits {
+            // Chữ nhỏ hơn nên nhích xuống một chút cho cùng đường chân chữ với số liệu
+            let nx = x + value_w;
+            self.set_brush(self.secondary, alpha);
+            self.draw_text(
+                note,
+                &self.fmt_alert_app,
+                rect(nx, top + 2.5, r.right - 8.0, bottom),
+            );
+        }
     }
 
     /// Nhiệt kế nhỏ, tâm (cx, cy)

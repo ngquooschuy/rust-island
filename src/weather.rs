@@ -67,15 +67,15 @@ impl Sky {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DayForecast {
     pub sky: Sky,
-    /// Nhiệt độ cao nhất, thấp nhất trong ngày
-    pub max: f32,
-    pub min: f32,
+    /// Khả năng có mưa cao nhất trong ngày, phần trăm (None nếu Open-Meteo không có số liệu)
+    pub rain_chance: Option<u8>,
 }
 
 impl DayForecast {
-    /// "28° / 21°"
-    pub fn range_label(&self) -> String {
-        format!("{} / {}", degrees(self.max), degrees(self.min))
+    /// "60%", hoặc "--" nếu không có số liệu
+    pub fn rain_label(&self) -> String {
+        self.rain_chance
+            .map_or_else(|| "--".to_string(), |p| format!("{p}%"))
     }
 }
 
@@ -130,7 +130,7 @@ fn forecast_url(place: &Place, fahrenheit: bool) -> String {
     format!(
         "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}\
          &current=temperature_2m,weather_code,is_day,apparent_temperature,relative_humidity_2m\
-         &daily=weather_code,temperature_2m_max,temperature_2m_min&forecast_days=2\
+         &daily=weather_code,precipitation_probability_max&forecast_days=2\
          &timezone=auto&temperature_unit={unit}",
         place.latitude, place.longitude
     )
@@ -173,18 +173,16 @@ struct Daily {
     #[serde(default)]
     weather_code: Vec<Option<u16>>,
     #[serde(default)]
-    temperature_2m_max: Vec<Option<f32>>,
-    #[serde(default)]
-    temperature_2m_min: Vec<Option<f32>>,
+    precipitation_probability_max: Vec<Option<f32>>,
 }
 
 impl Daily {
-    /// Dự báo của ngày thứ `i` (0 = hôm nay); thiếu số liệu thì None
+    /// Dự báo của ngày thứ `i` (0 = hôm nay); không có kiểu trời thì None
     fn day(&self, i: usize) -> Option<DayForecast> {
+        let rain = self.precipitation_probability_max.get(i).copied().flatten();
         Some(DayForecast {
             sky: Sky::from_wmo((*self.weather_code.get(i)?)?),
-            max: (*self.temperature_2m_max.get(i)?)?,
-            min: (*self.temperature_2m_min.get(i)?)?,
+            rain_chance: rain.map(|p| p.round().clamp(0.0, 100.0) as u8),
         })
     }
 }
@@ -255,8 +253,7 @@ fn fake() -> Option<Weather> {
         humidity: Some(42),
         tomorrow: Some(DayForecast {
             sky: Sky::Rain,
-            max: temperature + 1.0,
-            min: temperature - 6.0,
+            rain_chance: Some(60),
         }),
     })
 }
@@ -295,7 +292,7 @@ mod tests {
         "current":{"time":"2026-11-09T23:45","interval":900,"temperature_2m":16.9,
         "weather_code":3,"is_day":0,"apparent_temperature":15.2,"relative_humidity_2m":81},
         "daily":{"time":["2026-11-09","2026-11-10"],"weather_code":[3,61],
-        "temperature_2m_max":[24.1,22.6],"temperature_2m_min":[16.0,17.4]}}"#;
+        "precipitation_probability_max":[15,72.4]}}"#;
     /// Bản trả về cũ (chỉ có thời tiết hiện tại) vẫn đọc được
     const CURRENT_ONLY_JSON: &str = r#"{"current":{"temperature_2m":30.0,"weather_code":0,
         "is_day":1}}"#;
@@ -343,7 +340,8 @@ mod tests {
         assert_eq!(w.humidity, Some(81));
         let tomorrow = w.tomorrow.unwrap();
         assert_eq!(tomorrow.sky, Sky::Rain);
-        assert_eq!(tomorrow.range_label(), "23° / 17°");
+        assert_eq!(tomorrow.rain_chance, Some(72));
+        assert_eq!(tomorrow.rain_label(), "72%");
 
         let old = parse_weather(CURRENT_ONLY_JSON, &hanoi()).unwrap();
         assert_eq!(
@@ -353,11 +351,17 @@ mod tests {
     }
 
     #[test]
-    fn missing_forecast_values_give_no_tomorrow() {
+    fn missing_forecast_values() {
+        // Không có kiểu trời ngày mai: không có dự báo
         let json = r#"{"current":{"temperature_2m":30.0,"weather_code":0,"is_day":1},
-            "daily":{"weather_code":[0,null],"temperature_2m_max":[31.0,30.0],
-            "temperature_2m_min":[25.0,24.0]}}"#;
+            "daily":{"weather_code":[0,null],"precipitation_probability_max":[10,40]}}"#;
         assert_eq!(parse_weather(json, &hanoi()).unwrap().tomorrow, None);
+        // Có kiểu trời nhưng thiếu khả năng mưa: hiện "--"
+        let json = r#"{"current":{"temperature_2m":30.0,"weather_code":0,"is_day":1},
+            "daily":{"weather_code":[0,2],"precipitation_probability_max":[10,null]}}"#;
+        let tomorrow = parse_weather(json, &hanoi()).unwrap().tomorrow.unwrap();
+        assert_eq!(tomorrow.rain_chance, None);
+        assert_eq!(tomorrow.rain_label(), "--");
     }
 
     #[test]
@@ -366,7 +370,7 @@ mod tests {
         assert!(url.contains("latitude=21.0245&longitude=105.84117"));
         assert!(url.contains("temperature_unit=fahrenheit"));
         assert!(url.contains("apparent_temperature,relative_humidity_2m"));
-        assert!(url.contains("&daily=weather_code,temperature_2m_max,temperature_2m_min"));
+        assert!(url.contains("&daily=weather_code,precipitation_probability_max"));
         assert!(url.contains("&forecast_days=2"));
     }
 
