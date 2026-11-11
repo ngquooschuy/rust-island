@@ -21,6 +21,8 @@ use super::lrclib::Track;
 pub const MAX_AGE: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 /// Đổi định dạng file thì tăng số này; file cũ sẽ bị bỏ qua và tải lại
 const FORMAT_VERSION: u32 = 1;
+/// Lúc sửa cách tìm lời (11/11/2026, giây kể từ 1970): kiểm tra tên bài, ưu tiên lời đồng bộ
+const SEARCH_REVISED_AT: u64 = 1_794_404_000;
 const EXTENSION: &str = "json";
 
 /// Nội dung một file cache
@@ -162,7 +164,11 @@ impl Cache {
         }
         touch(&path, now);
         let age = unix_now(now).saturating_sub(entry.fetched_at);
-        Some((entry, age < MAX_AGE.as_secs()))
+        // Bản chỉ có lời thường tải trước khi sửa cách tìm có thể là bài khác hoặc bỏ sót
+        // bản đồng bộ: tra lại một lần
+        let before_revision = entry.synced.is_none() && entry.fetched_at < SEARCH_REVISED_AT;
+        let fresh = age < MAX_AGE.as_secs() && !before_revision;
+        Some((entry, fresh))
     }
 
     /// Lưu lời của bài `t` (chỉ khi thật sự có lời), rồi dọn bớt nếu vượt giới hạn
@@ -397,11 +403,36 @@ mod tests {
         let cache = Cache::new(tmp.0.clone(), 25).unwrap();
         let t = track("Old");
         cache
-            .store_at(&t, None, Some("words".into()), Timing::default(), at(0))
+            .store_at(
+                &t,
+                Some("[00:01.00] a".into()),
+                None,
+                Timing::default(),
+                at(0),
+            )
             .unwrap();
         let day = 24 * 60 * 60;
         assert!(cache.load_at(&t, at(89 * day)).unwrap().1);
         assert!(!cache.load_at(&t, at(91 * day)).unwrap().1);
+    }
+
+    #[test]
+    fn plain_only_entries_from_before_search_fix_are_stale() {
+        let tmp = TempDir::new("revised");
+        let cache = Cache::new(tmp.0.clone(), 25).unwrap();
+        let (old, new) = (track("Plain old"), track("Plain new"));
+        let before = SEARCH_REVISED_AT - 60;
+        let after = SEARCH_REVISED_AT + 60;
+        let plain = || Some("words".to_string());
+        cache
+            .store_at(&old, None, plain(), Timing::default(), at(before))
+            .unwrap();
+        cache
+            .store_at(&new, None, plain(), Timing::default(), at(after))
+            .unwrap();
+        // Bản cũ: tra lại (vẫn còn để dự phòng); bản tải sau khi sửa: dùng luôn
+        assert!(!cache.load_at(&old, at(after)).unwrap().1);
+        assert!(cache.load_at(&new, at(after + 60)).unwrap().1);
     }
 
     #[test]
