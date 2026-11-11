@@ -81,8 +81,29 @@ pub fn timing_for(title: &str, artist: &str) -> Timing {
     }
 }
 
+/// Bài vừa được tra lời gần nhất, cho cửa sổ Cài đặt chỉnh lời sớm/muộn
+#[derive(Debug, Clone, PartialEq)]
+pub struct NowPlaying {
+    pub title: String,
+    pub artist: String,
+    /// Có lời chạy theo nhạc không (chỉ lời này mới chỉnh sớm/muộn được)
+    pub synced: bool,
+    pub timing: Timing,
+}
+
+pub fn now_playing() -> Option<NowPlaying> {
+    let state = STATE.lock().unwrap();
+    let (track, status, timing) = state.as_ref()?;
+    Some(NowPlaying {
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        synced: matches!(status, Status::Synced(_)),
+        timing: *timing,
+    })
+}
+
 /// Người dùng chỉnh lời sớm/muộn cho bài (title, artist). `save`: ghi luôn xuống đĩa
-/// (lúc đang kéo thanh trượt thì chưa ghi, thả tay mới ghi)
+/// (lúc đang kéo thanh trượt trong Cài đặt thì chưa ghi, thả tay mới ghi)
 pub fn set_offset(title: &str, artist: &str, offset_ms: i64, save: bool) {
     let offset_ms = offset_ms.clamp(-MAX_OFFSET_MS, MAX_OFFSET_MS);
     let track = {

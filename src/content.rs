@@ -5,7 +5,7 @@ use windows::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocal
 
 use crate::battery::{self, Battery};
 use crate::config::ClockConfig;
-use crate::lyrics::{self, Status, Timing};
+use crate::lyrics::{self, Status};
 use crate::media::{self, MediaInfo};
 use crate::weather::{self, Weather};
 
@@ -33,10 +33,6 @@ pub struct Content {
     pub song: String,
     pub title: String,
     pub artist: String,
-    /// Tên bài và nghệ sĩ đầy đủ như trình phát báo (`title`, `artist` đã bị cắt ngắn để vẽ),
-    /// dùng làm khóa khi chỉnh lời sớm/muộn
-    pub track_title: String,
-    pub track_artist: String,
     pub playing: bool,
     pub battery: Option<Battery>,
     /// None khi chưa tải được hoặc đã tắt trong cấu hình
@@ -44,8 +40,6 @@ pub struct Content {
     /// Thanh tiến độ; None nếu trình phát không báo thời lượng
     pub progress: Option<Progress>,
     pub lyrics: LyricsView,
-    /// Chỉnh lời sớm/muộn của bài đang phát (None: không có lời chạy theo nhạc)
-    pub timing: Option<Timing>,
 }
 
 /// Vị trí phát hiện tại và thời lượng bài (mili giây)
@@ -208,15 +202,13 @@ pub fn current(clock: &ClockConfig, lyrics_enabled: bool) -> Content {
     let media = media::snapshot();
     let position_ms = media::position_at(&media, media::now_ticks());
     let status = lyrics::status_for(&media.title, &media.artist);
+    // Người dùng chỉnh lời sớm/muộn cho bài này (trong cửa sổ Cài đặt)
     let timing = lyrics::timing_for(&media.title, &media.artist);
-    // Chỉ lời chạy theo nhạc mới chỉnh sớm/muộn được
-    let synced = matches!(status, Some(Status::Synced(_)));
     let lyrics_pos = shift(position_ms, timing.offset_ms);
     Content {
         weather: weather::snapshot(),
         progress: progress(&media, position_ms),
         lyrics: lyrics_view(lyrics_enabled, &media, status, lyrics_pos),
-        timing: (lyrics_enabled && synced).then_some(timing),
         ..build(&now, &media, battery::status(), clock)
     }
 }
@@ -308,13 +300,10 @@ fn build(
         artist: truncate(&media.artist, 30),
         playing: media.playing,
         battery,
-        track_title: media.title.clone(),
-        track_artist: media.artist.clone(),
         // current() điền vào sau
         weather: None,
         progress: None,
         lyrics: LyricsView::Off,
-        timing: None,
     }
 }
 

@@ -24,8 +24,7 @@ use crate::battery::Battery;
 use crate::config::{BackdropKind, Color, Config};
 use crate::content::{self, Content, LyricsView, Page, Progress};
 use crate::icon::Icon;
-use crate::layout::{LYRICS_BUTTON, Layout, OffsetRow};
-use crate::lyrics::Timing;
+use crate::layout::{LYRICS_BUTTON, Layout};
 use crate::weather::{Sky, Weather};
 
 /// Màu cố định cho trạng thái pin (theo màu hệ thống của Apple)
@@ -51,10 +50,6 @@ pub struct Frame<'a> {
     pub lyrics_on: bool,
     /// Trang Media mở rộng có khung lời (cao hơn, có 3 dòng lời)
     pub lyrics_panel: bool,
-    /// Hàng thanh trượt chỉnh lời sớm/muộn (None: không hiện hàng này)
-    pub offset_row: Option<Timing>,
-    /// Đang kéo thanh trượt (nút kéo to hơn một chút)
-    pub dragging_offset: bool,
     /// Ảnh bìa bài đang phát (đã đưa lên card đồ họa)
     pub cover: Option<&'a ID2D1Bitmap1>,
     /// Câu lời hiện trên island thu gọn (None: hiện tên bài như thường)
@@ -1135,10 +1130,6 @@ impl Graphics {
         if frame.lyrics_panel {
             self.draw_header_line(frame, (el, right), alpha);
             self.draw_lyric_lines(frame, (el, right), alpha);
-            if let Some(timing) = frame.offset_row {
-                let row = self.layout.offset_row(frame.h);
-                self.draw_offset_row(&row, timing, frame.dragging_offset, alpha);
-            }
         } else {
             self.draw_header_big(frame, (el, right), alpha);
         }
@@ -1289,62 +1280,6 @@ impl Graphics {
             self.draw_text(&text, format, area);
             unsafe { self.d2d_context.PopAxisAlignedClip() };
         }
-    }
-
-    /// "Lời có thể lệch  ───────┼━━━●──  +12.5 s": kéo sang phải thì lời hiện muộn hơn
-    fn draw_offset_row(&self, row: &OffsetRow, timing: Timing, dragging: bool, alpha: f32) {
-        let cy = row.cy;
-        let (top, bottom) = (cy - 9.0, cy + 9.0);
-        // Bản lời dài khác video: nhắc người dùng là lời có thể lệch
-        let label = if timing.approximate {
-            "Lời có thể lệch"
-        } else {
-            "Chỉnh lời"
-        };
-        self.set_brush(self.secondary, alpha);
-        self.draw_text(
-            label,
-            &self.fmt_alert_app,
-            rect(row.label.0, top, row.label.1, bottom),
-        );
-
-        let (x0, x1) = row.track;
-        let mid = (x0 + x1) / 2.0;
-        let knob = row.x_of(timing.offset_ms);
-        self.set_brush(self.text, alpha * 0.18);
-        self.fill(rounded(rect(x0, cy - 2.0, x1, cy + 2.0), 2.0));
-        // Vạch giữa thanh = không lệch
-        self.set_brush(self.secondary, alpha * 0.7);
-        self.fill(rounded(
-            rect(mid - 0.75, cy - 5.0, mid + 0.75, cy + 5.0),
-            0.75,
-        ));
-        // Phần tô màu đi từ giữa tới nút kéo
-        self.set_brush(self.accent, alpha);
-        let (from, to) = if knob < mid { (knob, mid) } else { (mid, knob) };
-        if to - from > 0.5 {
-            self.fill(rounded(rect(from, cy - 2.0, to, cy + 2.0), 2.0));
-        }
-        self.set_brush(self.text, alpha);
-        self.circle(knob, cy, if dragging { 7.0 } else { 6.0 });
-
-        let seconds = timing.offset_ms as f32 / 1000.0;
-        let value = if timing.offset_ms == 0 {
-            "0 s".to_string()
-        } else {
-            format!("{seconds:+.1} s")
-        };
-        let color = if timing.offset_ms == 0 {
-            self.secondary
-        } else {
-            self.text
-        };
-        self.set_brush(color, alpha);
-        self.draw_text(
-            &value,
-            &self.fmt_tiny,
-            rect(row.value.0, top, row.value.1, bottom),
-        );
     }
 
     /// Tô một tam giác (biểu tượng nút phát, lùi, tới)

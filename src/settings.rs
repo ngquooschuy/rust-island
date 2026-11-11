@@ -5,7 +5,7 @@
 //! Mọi control là con trực tiếp của cửa sổ và được tìm lại bằng mã số (`GetDlgItem`),
 //! nên trạng thái riêng chỉ còn vài giá trị nhỏ, `Copy` được, cất trong một `Cell`.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 
 use windows::{
@@ -58,9 +58,26 @@ const ID_CLEAR_CACHE: i32 = 64;
 const ID_ALERT_CLIPBOARD: i32 = 70;
 const ID_ALERT_NOTIFICATIONS: i32 = 71;
 const ID_ALERT_SECONDS: i32 = 72;
+const ID_OFFSET_SONG: i32 = 80;
+const ID_OFFSET: i32 = 81;
+const ID_OFFSET_VALUE: i32 = 82;
+const ID_OFFSET_RESET: i32 = 83;
+
+/// Thanh trượt chỉnh lời: mỗi nấc nửa giây, vạch chia mỗi 10 giây
+const OFFSET_STEP_MS: i64 = 500;
+const OFFSET_TICK_EVERY: isize = 20;
+/// Timer kiểm tra bài đang phát đã đổi chưa (để thanh trượt luôn ứng với bài hiện tại)
+const TIMER_NOW_PLAYING: usize = 1;
+// Thông điệp của thanh trượt Windows (TBM_*) dùng tới mà crate windows chưa có tên sẵn
+const TBM_SETRANGEMIN: u32 = WM_USER + 7;
+const TBM_SETRANGEMAX: u32 = WM_USER + 8;
+const TBM_SETTICFREQ: u32 = WM_USER + 20;
+const TBM_SETPAGESIZE: u32 = WM_USER + 21;
+/// Mã trong WM_HSCROLL báo người dùng đã kéo/bấm xong (thả chuột, nhả phím)
+const TB_ENDTRACK: usize = 8;
 
 /// Kích thước vùng trong cửa sổ, ở tỉ lệ 100% (96 DPI)
-const CLIENT: (i32, i32) = (640, 556);
+const CLIENT: (i32, i32) = (640, 650);
 
 const BACKDROPS: [(BackdropKind, &str); 3] = [
     (BackdropKind::None, "Không"),
@@ -84,6 +101,8 @@ struct State {
 
 thread_local! {
     static STATE: Cell<Option<State>> = const { Cell::new(None) };
+    /// Bài mà thanh trượt chỉnh lời đang ứng với (tên + nghệ sĩ), để biết khi nào bài đổi
+    static OFFSET_SONG: RefCell<String> = const { RefCell::new(String::new()) };
     /// 16 màu tự chọn trong hộp chọn màu của Windows, nhớ trong lúc app chạy
     static CUSTOM_COLORS: Cell<[COLORREF; 16]> = const { Cell::new([COLORREF(0xFFFFFF); 16]) };
 }
@@ -529,6 +548,21 @@ fn create(island: HWND) -> windows::core::Result<()> {
         fill(hwnd, &config);
         set_checked(hwnd, ID_AUTOSTART, autostart::is_enabled());
         update_enabled(hwnd);
+        // Thanh trượt chỉnh lời: −60 … +60 giây tính theo nấc nửa giây
+        let steps = (lyrics::MAX_OFFSET_MS / OFFSET_STEP_MS) as isize;
+        send(hwnd, ID_OFFSET, TBM_SETRANGEMIN, 0, -steps);
+        send(hwnd, ID_OFFSET, TBM_SETRANGEMAX, 1, steps);
+        send(
+            hwnd,
+            ID_OFFSET,
+            TBM_SETTICFREQ,
+            OFFSET_TICK_EVERY as usize,
+            0,
+        );
+        send(hwnd, ID_OFFSET, TBM_SETPAGESIZE, 0, 2); // bấm hai bên thanh: 1 giây
+        OFFSET_SONG.with_borrow_mut(String::clear);
+        refresh_offset(hwnd);
+        SetTimer(Some(hwnd), TIMER_NOW_PLAYING, 1000, None);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
@@ -612,25 +646,58 @@ fn build(b: &Builder) {
     b.combo(456, 356, 158, ID_CACHE);
     b.button("", 362, 394, 252, ID_CLEAR_CACHE, false);
 
-    // ===== Hàng nút =====
-    // ===== Hàng dưới, trải hết chiều ngang =====
-    b.group("Thông báo trên island", 12, 444, 616, 60);
-    b.check("Nội dung vừa sao chép", 24, 468, 190, ID_ALERT_CLIPBOARD);
+    // ===== Các hàng dưới, trải hết chiều ngang =====
+    // Chỉnh lời sớm/muộn cho bài đang phát: áp dụng ngay, không cần bấm Lưu
+    b.group(
+        "Lời bài đang phát (chỉnh là áp dụng ngay)",
+        12,
+        444,
+        616,
+        86,
+    );
+    // SS_ENDELLIPSIS: tên bài dài quá thì Windows tự cắt và thêm "…"
+    const SS_CENTERIMAGE_ENDELLIPSIS: i32 = 0x200 | 0x4000;
+    let ex = WINDOW_EX_STYLE(0);
+    let song_label = (24, 466, 592, 23);
+    b.add(
+        w!("STATIC"),
+        "",
+        SS_CENTERIMAGE_ENDELLIPSIS,
+        ex,
+        song_label,
+        ID_OFFSET_SONG,
+    );
+    b.label("Lời sớm/muộn", 24, 496, 96, -1);
+    // Thanh trượt kiểu Windows: kéo, bấm hai bên, hoặc dùng phím mũi tên
+    let style = (TBS_HORZ | TBS_AUTOTICKS) as i32 | WS_TABSTOP.0 as i32;
+    b.add(
+        TRACKBAR_CLASSW,
+        "",
+        style,
+        ex,
+        (120, 492, 352, 30),
+        ID_OFFSET,
+    );
+    b.label("", 476, 496, 64, ID_OFFSET_VALUE);
+    b.button("Về 0", 540, 494, 76, ID_OFFSET_RESET, false);
+
+    b.group("Thông báo trên island", 12, 538, 616, 60);
+    b.check("Nội dung vừa sao chép", 24, 562, 190, ID_ALERT_CLIPBOARD);
     b.check(
         "Thông báo của Windows",
         220,
-        468,
+        562,
         190,
         ID_ALERT_NOTIFICATIONS,
     );
-    b.label("Hiện trong", 430, 468, 70, -1);
-    b.edit(502, 468, 44, ID_ALERT_SECONDS, true);
-    b.label("giây", 552, 468, 60, -1);
+    b.label("Hiện trong", 430, 562, 70, -1);
+    b.edit(502, 562, 44, ID_ALERT_SECONDS, true);
+    b.label("giây", 552, 562, 60, -1);
 
     // ===== Hàng nút =====
-    b.button("Mặc định", 12, 516, 100, ID_DEFAULTS, false);
-    b.button("Hủy", 420, 516, 100, ID_CANCEL, false);
-    b.button("Lưu", 528, 516, 100, ID_SAVE, true);
+    b.button("Mặc định", 12, 610, 100, ID_DEFAULTS, false);
+    b.button("Hủy", 420, 610, 100, ID_CANCEL, false);
+    b.button("Lưu", 528, 610, 100, ID_SAVE, true);
 
     let hwnd = b.parent;
     for (kind, label) in BACKDROPS {
@@ -782,6 +849,100 @@ fn read(hwnd: HWND) -> Result<Config, &'static str> {
     Ok(c)
 }
 
+// ---------- Chỉnh lời sớm/muộn ----------
+
+/// "+5.0 s", "−12.5 s", "0 s"
+fn offset_label(offset_ms: i64) -> String {
+    if offset_ms == 0 {
+        "0 s".to_string()
+    } else {
+        format!("{:+.1} s", offset_ms as f64 / 1000.0)
+    }
+}
+
+/// Dòng mô tả bài đang phát phía trên thanh trượt
+fn now_playing_line(np: Option<&lyrics::NowPlaying>) -> String {
+    match np {
+        Some(np) if np.synced => {
+            // Bản lời ngắn hơn video (MV có đoạn mở đầu...): lời có thể chạy sớm.
+            // Ghi chú đặt đầu dòng để tên bài dài có bị cắt cũng không mất ghi chú
+            let mut line = if np.timing.approximate {
+                "Lời có thể lệch, kéo cho khớp  ·  ".to_string()
+            } else {
+                String::new()
+            };
+            line.push_str(&np.title);
+            if !np.artist.is_empty() {
+                line.push_str(" — ");
+                line.push_str(&np.artist);
+            }
+            line
+        }
+        Some(np) => format!(
+            "{} — chưa có lời chạy theo nhạc nên không chỉnh được",
+            np.title
+        ),
+        None => "Chưa có bài nào đang phát".to_string(),
+    }
+}
+
+/// Đưa bài đang phát và độ lệch của nó lên nhóm "Lời bài đang phát".
+/// Chỉ làm lại khi bài đã đổi, để không giật thanh trượt khi người dùng đang kéo
+fn refresh_offset(hwnd: HWND) {
+    let np = lyrics::now_playing();
+    let key = np
+        .as_ref()
+        .map(|n| format!("{}\u{1}{}\u{1}{}", n.title, n.artist, n.synced))
+        .unwrap_or_default();
+    let changed = OFFSET_SONG.with_borrow_mut(|old| {
+        let changed = *old != key || old.is_empty();
+        *old = key;
+        changed
+    });
+    if !changed {
+        return;
+    }
+    set_text(hwnd, ID_OFFSET_SONG, &now_playing_line(np.as_ref()));
+    let synced = np.as_ref().is_some_and(|n| n.synced);
+    let offset = np.as_ref().map_or(0, |n| n.timing.offset_ms);
+    send(
+        hwnd,
+        ID_OFFSET,
+        TBM_SETPOS,
+        1,
+        (offset / OFFSET_STEP_MS) as isize,
+    );
+    set_text(hwnd, ID_OFFSET_VALUE, &offset_label(offset));
+    for id in [ID_OFFSET, ID_OFFSET_RESET] {
+        enable(hwnd, id, synced);
+    }
+}
+
+/// Áp độ lệch mới cho bài đang phát và báo island vẽ lại ngay
+fn apply_offset(hwnd: HWND, offset_ms: i64, save: bool) {
+    let Some(np) = lyrics::now_playing().filter(|n| n.synced) else {
+        return;
+    };
+    lyrics::set_offset(&np.title, &np.artist, offset_ms, save);
+    set_text(hwnd, ID_OFFSET_VALUE, &offset_label(offset_ms));
+    if let Some(s) = STATE.get() {
+        unsafe {
+            let _ = PostMessageW(
+                Some(s.island),
+                lyrics::WM_LYRICS_CHANGED,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// Người dùng kéo thanh trượt chỉnh lời; thả tay (`TB_ENDTRACK`) mới ghi xuống đĩa
+fn on_offset_scroll(hwnd: HWND, code: usize) {
+    let pos = send(hwnd, ID_OFFSET, WM_USER, 0, 0) as i64; // WM_USER = TBM_GETPOS
+    apply_offset(hwnd, pos * OFFSET_STEP_MS, code == TB_ENDTRACK);
+}
+
 /// Chữ số cạnh các thanh trượt
 fn update_values(hwnd: HWND) {
     set_text(
@@ -863,6 +1024,10 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
             let _ = DestroyWindow(hwnd);
         },
         ID_DEFAULTS => fill(hwnd, &Config::default()),
+        ID_OFFSET_RESET => {
+            send(hwnd, ID_OFFSET, TBM_SETPOS, 1, 0);
+            apply_offset(hwnd, 0, true);
+        }
         ID_CLEAR_CACHE => {
             lyrics::clear_cache();
             update_enabled(hwnd);
@@ -888,7 +1053,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             on_command(hwnd, id, code);
         }
-        WM_HSCROLL => update_values(hwnd), // kéo thanh trượt
+        // Kéo thanh trượt: thanh chỉnh lời áp dụng ngay, các thanh khác chỉ đổi số hiển thị
+        WM_HSCROLL if HWND(lparam.0 as *mut c_void) == item(hwnd, ID_OFFSET) => {
+            on_offset_scroll(hwnd, wparam.0 & 0xFFFF);
+        }
+        WM_HSCROLL => update_values(hwnd),
+        WM_TIMER if wparam.0 == TIMER_NOW_PLAYING => refresh_offset(hwnd),
         WM_DRAWITEM => {
             draw_swatch(unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) });
             return LRESULT(1);
@@ -916,6 +1086,33 @@ mod tests {
         }
         assert_eq!(percent_to_alpha(100), 255);
         assert_eq!(alpha_to_percent(0x90), 56);
+    }
+
+    #[test]
+    fn offset_labels() {
+        assert_eq!(offset_label(0), "0 s");
+        assert_eq!(offset_label(5_000), "+5.0 s");
+        assert_eq!(offset_label(-12_500), "-12.5 s");
+    }
+
+    #[test]
+    fn now_playing_line_explains_what_can_be_adjusted() {
+        let np = |synced, approximate| lyrics::NowPlaying {
+            title: "Buông Đôi Tay Nhau Ra".into(),
+            artist: "Sơn Tùng M-TP Official".into(),
+            synced,
+            timing: lyrics::Timing {
+                offset_ms: 0,
+                approximate,
+            },
+        };
+        assert_eq!(
+            now_playing_line(Some(&np(true, false))),
+            "Buông Đôi Tay Nhau Ra — Sơn Tùng M-TP Official"
+        );
+        assert!(now_playing_line(Some(&np(true, true))).starts_with("Lời có thể lệch"));
+        assert!(now_playing_line(Some(&np(false, false))).contains("không chỉnh được"));
+        assert_eq!(now_playing_line(None), "Chưa có bài nào đang phát");
     }
 
     #[test]
