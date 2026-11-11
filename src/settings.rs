@@ -100,6 +100,11 @@ pub fn open(island: HWND) {
     let _ = create(island);
 }
 
+/// Cửa sổ Cài đặt đang mở? (khi đó island coi như đang được dùng, không tự thu nhỏ)
+pub fn is_open() -> bool {
+    STATE.get().is_some()
+}
+
 /// Vòng lặp thông điệp gọi trước khi xử lý mỗi thông điệp: cho phím Tab, Enter, Esc
 /// hoạt động trong cửa sổ Cài đặt như một hộp thoại. true = đã xử lý xong
 pub fn pre_translate(msg: &MSG) -> bool {

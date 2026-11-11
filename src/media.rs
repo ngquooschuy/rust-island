@@ -1,14 +1,19 @@
 //! Đọc bài đang phát và gửi lệnh điều khiển qua API media của Windows.
 //! Chạy trên một luồng nền riêng; báo cho cửa sổ bằng `WM_MEDIA_CHANGED`.
 
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use windows::{
+    Graphics::Imaging::{
+        BitmapAlphaMode, BitmapBounds, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat,
+        BitmapTransform, ColorManagementMode, ExifOrientationMode,
+    },
     Media::Control::{
         GlobalSystemMediaTransportControlsSessionManager,
         GlobalSystemMediaTransportControlsSessionPlaybackStatus,
     },
+    Storage::Streams::IRandomAccessStream,
     Win32::{
         Foundation::{HWND, LPARAM, WPARAM},
         System::{
@@ -17,9 +22,10 @@ use windows::{
         },
         UI::WindowsAndMessaging::{PostMessageW, WM_APP},
     },
-    core::Result,
+    core::{Interface, Result},
 };
 
+use crate::icon::Icon;
 use crate::lyrics::{Requester, Track};
 
 /// Luồng media gửi thông điệp này về cửa sổ khi bài hát/trạng thái đổi
@@ -80,6 +86,79 @@ static MEDIA: Mutex<MediaInfo> = Mutex::new(MediaInfo {
     duration_ms: 0,
     updated_ticks: 0,
 });
+
+/// Ảnh bìa của bài đang phát, kèm khóa của bài đó (để không hiện nhầm ảnh bài trước)
+static COVER: Mutex<Option<(String, Arc<Icon>)>> = Mutex::new(None);
+/// Ảnh bìa được cắt vuông và thu về cạnh này (điểm ảnh); vẽ ra nhỏ hơn nên vẫn nét
+const COVER_SIZE: u32 = 96;
+/// Trình phát thường báo ảnh bìa chậm hơn tên bài một chút: thử lại vài lần
+const COVER_TRIES: u32 = 4;
+
+fn track_key(title: &str, artist: &str) -> String {
+    format!("{title}\u{1}{artist}")
+}
+
+/// Ảnh bìa nếu đúng là của bài (title, artist)
+pub fn cover_for(title: &str, artist: &str) -> Option<Arc<Icon>> {
+    let cover = COVER.lock().unwrap();
+    let (key, icon) = cover.as_ref()?;
+    (*key == track_key(title, artist)).then(|| icon.clone())
+}
+
+/// Kích thước sau khi thu nhỏ để cạnh ngắn bằng `size`, và vùng vuông ở giữa cần cắt
+fn square_crop(w: u32, h: u32, size: u32) -> ((u32, u32), BitmapBounds) {
+    let short = w.min(h).max(1) as f32;
+    let scaled = |v: u32| ((v as f32 * size as f32 / short).round() as u32).max(size);
+    let (sw, sh) = (scaled(w), scaled(h));
+    let bounds = BitmapBounds {
+        X: (sw - size) / 2,
+        Y: (sh - size) / 2,
+        Width: size,
+        Height: size,
+    };
+    ((sw, sh), bounds)
+}
+
+/// Giải mã ảnh (JPEG/PNG...) thành ô vuông COVER_SIZE, cắt phần giữa như ảnh bìa
+fn decode_cover(stream: &IRandomAccessStream) -> Result<Icon> {
+    let decoder = BitmapDecoder::CreateAsync(stream)?.join()?;
+    let ((sw, sh), bounds) = square_crop(decoder.PixelWidth()?, decoder.PixelHeight()?, COVER_SIZE);
+    let transform = BitmapTransform::new()?;
+    transform.SetScaledWidth(sw)?;
+    transform.SetScaledHeight(sh)?;
+    transform.SetBounds(bounds)?;
+    transform.SetInterpolationMode(BitmapInterpolationMode::Fant)?; // thu nhỏ mịn
+    let data = decoder
+        .GetPixelDataTransformedAsync(
+            BitmapPixelFormat::Bgra8,
+            BitmapAlphaMode::Premultiplied,
+            &transform,
+            ExifOrientationMode::RespectExifOrientation,
+            ColorManagementMode::DoNotColorManage,
+        )?
+        .join()?;
+    Ok(Icon {
+        width: COVER_SIZE,
+        height: COVER_SIZE,
+        pixels: data.DetachPixelData()?.to_vec(),
+    })
+}
+
+/// Ảnh bìa trình phát báo cho bài hiện tại
+fn load_cover(manager: &GlobalSystemMediaTransportControlsSessionManager) -> Option<Icon> {
+    if let Some(path) = fake_cover_path() {
+        let file = windows::Storage::StorageFile::GetFileFromPathAsync(&path.into())
+            .ok()?
+            .join()
+            .ok()?;
+        let stream = file.OpenReadAsync().ok()?.join().ok()?;
+        return decode_cover(&stream.cast().ok()?).ok();
+    }
+    let session = manager.GetCurrentSession().ok()?;
+    let props = session.TryGetMediaPropertiesAsync().ok()?.join().ok()?;
+    let stream = props.Thumbnail().ok()?.OpenReadAsync().ok()?.join().ok()?;
+    decode_cover(&stream.cast().ok()?).ok()
+}
 
 /// Giờ hiện tại theo đồng hồ hệ thống, đơn vị 100 ns kể từ năm 1601
 pub fn now_ticks() -> i64 {
@@ -158,6 +237,9 @@ pub fn run(hwnd_raw: isize, commands: Receiver<MediaCommand>, lyrics: Option<Req
     let mut last = MediaInfo::default();
     let mut requested: Option<Track> = None;
     let started_ticks = now_ticks();
+    // Bài đang lấy ảnh bìa, và còn thử được mấy lần
+    let mut cover_track = String::new();
+    let mut cover_tries = 0;
     loop {
         match commands.recv_timeout(Duration::from_millis(1000)) {
             Ok(cmd) => {
@@ -176,7 +258,26 @@ pub fn run(hwnd_raw: isize, commands: Receiver<MediaCommand>, lyrics: Option<Req
                 requested = Some(track);
             }
         }
-        if info != last {
+        // Ảnh bìa: đổi bài thì lấy ảnh mới; chưa có ảnh thì thử lại vài giây sau
+        let mut cover_changed = false;
+        let key = track_key(&info.title, &info.artist);
+        if info.title.is_empty() {
+            cover_track.clear();
+        } else if key != cover_track {
+            cover_track = key.clone();
+            cover_tries = COVER_TRIES;
+            *COVER.lock().unwrap() = None;
+            cover_changed = true;
+        }
+        if cover_tries > 0 {
+            cover_tries -= 1;
+            if let Some(icon) = load_cover(&manager) {
+                *COVER.lock().unwrap() = Some((key, Arc::new(icon)));
+                cover_tries = 0;
+                cover_changed = true;
+            }
+        }
+        if info != last || cover_changed {
             *MEDIA.lock().unwrap() = info.clone();
             unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_MEDIA_CHANGED, WPARAM(0), LPARAM(0));
@@ -184,6 +285,14 @@ pub fn run(hwnd_raw: isize, commands: Receiver<MediaCommand>, lyrics: Option<Req
             last = info;
         }
     }
+}
+
+/// Chỉ bản debug: ISLAND_FAKE_COVER="đường dẫn ảnh" làm ảnh bìa cho bài giả lập
+fn fake_cover_path() -> Option<String> {
+    if !cfg!(debug_assertions) || std::env::var_os("ISLAND_FAKE_MEDIA").is_none() {
+        return None;
+    }
+    std::env::var("ISLAND_FAKE_COVER").ok()
 }
 
 /// Chỉ bản debug: ISLAND_FAKE_MEDIA="Tên bài|Nghệ sĩ|Album|thời lượng (giây)|bắt đầu từ giây"

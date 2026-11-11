@@ -72,6 +72,8 @@ pub enum LyricsView {
         prev: Option<String>,
         current: String,
         next: Option<String>,
+        /// Dòng đang hát đã hát được bao nhiêu (0 → 1), để tô chữ kiểu karaoke
+        progress: f32,
     },
 }
 
@@ -241,6 +243,7 @@ fn lyrics_view(
                 prev: w.prev.map(String::from),
                 current: w.current.to_string(),
                 next: w.next.map(String::from),
+                progress: w.progress,
             };
         }
     };
@@ -381,6 +384,8 @@ mod tests {
                 prev: Some("one".into()),
                 current: "two".into(),
                 next: Some("three".into()),
+                // "two" ngắn nên ước lượng 1200 ms, đã hát 1000 ms
+                progress: 1000.0 / 1200.0,
             }
         );
         assert_eq!(view.current_line(), Some("two"));

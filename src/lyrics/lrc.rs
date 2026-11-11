@@ -19,6 +19,24 @@ pub struct Window<'a> {
     pub prev: Option<&'a str>,
     pub current: &'a str,
     pub next: Option<&'a str>,
+    /// Dòng đang hát đã hát được bao nhiêu (0 → 1), để tô chữ kiểu karaoke
+    pub progress: f32,
+}
+
+/// LRC chỉ có mốc đầu mỗi dòng, không có mốc từng chữ, nên ước lượng thời gian hát
+/// một dòng theo độ dài của nó (hát chậm hơn nói: khoảng 10 ký tự mỗi giây)
+const MS_PER_CHAR: u64 = 95;
+const MIN_SUNG_MS: u64 = 1200;
+
+/// Dòng `text` bắt đầu lúc `start`, dòng sau bắt đầu lúc `next_start` (nếu có):
+/// tại `pos` đã hát được bao nhiêu phần của dòng. Không bao giờ chậm hơn dòng sau
+fn sung_fraction(text: &str, start: u64, next_start: Option<u64>, pos: u64) -> f32 {
+    let estimate = (text.chars().count() as u64 * MS_PER_CHAR).max(MIN_SUNG_MS);
+    let span = next_start.map_or(estimate, |n| estimate.min(n.saturating_sub(start)));
+    if span == 0 {
+        return 1.0;
+    }
+    (pos.saturating_sub(start) as f32 / span as f32).clamp(0.0, 1.0)
 }
 
 /// Dòng trống trong LRC là đoạn nhạc dạo, hiện bằng nốt nhạc
@@ -107,12 +125,23 @@ impl Lyrics {
                 prev: None,
                 current: GAP,
                 next: self.text(0),
+                progress: 1.0,
             },
-            Some(i) => Window {
-                prev: i.checked_sub(1).and_then(|p| self.text(p)),
-                current: self.text(i).unwrap_or(GAP),
-                next: self.text(i + 1),
-            },
+            Some(i) => {
+                let line = &self.lines[i];
+                let next_start = self.lines.get(i + 1).map(|l| l.time_ms);
+                let progress = if line.text.is_empty() {
+                    1.0 // đoạn nhạc dạo: nốt nhạc sáng luôn
+                } else {
+                    sung_fraction(&line.text, line.time_ms, next_start, pos_ms)
+                };
+                Window {
+                    prev: i.checked_sub(1).and_then(|p| self.text(p)),
+                    current: self.text(i).unwrap_or(GAP),
+                    next: self.text(i + 1),
+                    progress,
+                }
+            }
         }
     }
 }
@@ -186,6 +215,27 @@ mod tests {
         assert_eq!(intro.next, Some("Stranded in the open"));
         let end = l.window_at(999_999);
         assert_eq!(end.next, None);
+    }
+
+    #[test]
+    fn karaoke_progress_follows_the_estimated_singing_time() {
+        // 20 ký tự → ước lượng 1900 ms, dòng sau còn xa
+        let text = "Stranded in the open";
+        assert_eq!(sung_fraction(text, 1_000, Some(9_000), 1_000), 0.0);
+        assert!((sung_fraction(text, 1_000, Some(9_000), 1_950) - 0.5).abs() < 1e-6);
+        assert_eq!(sung_fraction(text, 1_000, Some(9_000), 4_000), 1.0);
+        // Dòng sau tới sớm hơn ước lượng: hát xong đúng lúc dòng sau bắt đầu
+        assert!((sung_fraction(text, 1_000, Some(2_000), 1_500) - 0.5).abs() < 1e-6);
+        // Dòng ngắn vẫn kéo dài ít nhất MIN_SUNG_MS; dòng cuối không có dòng sau
+        assert!((sung_fraction("Hi", 0, None, 600) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn window_progress_for_gaps_and_lines() {
+        let l = parse(SONG);
+        assert_eq!(l.window_at(0).progress, 1.0); // nhạc dạo trước dòng đầu
+        assert_eq!(l.window_at(10_600).progress, 1.0); // dòng trống
+        assert_eq!(l.window_at(6_200).progress, 0.0); // vừa vào dòng
     }
 
     #[test]
