@@ -26,6 +26,7 @@ pub struct Config {
     pub autohide: AutoHideConfig,
     pub lyrics: LyricsConfig,
     pub alerts: AlertsConfig,
+    pub lookup: LookupConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -175,6 +176,34 @@ impl Default for AlertsConfig {
             clipboard: true,
             notifications: true,
             seconds: 4,
+        }
+    }
+}
+
+/// Tra cứu nhanh (Quick Lookup): phím tắt mở hộp hỏi AI ngay trên island.
+/// API token không nằm ở đây mà trong Windows Credential Manager (xem secret.rs)
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LookupConfig {
+    pub enabled: bool,
+    /// Ví dụ "Ctrl+Alt+`" (xem hotkey.rs)
+    pub hotkey: String,
+    /// Model của Workers AI, ví dụ "@cf/openai/gpt-oss-20b"
+    pub model: String,
+    /// Account ID của Cloudflare
+    pub account_id: String,
+    /// Lời dặn cho trợ lý (vai trò, cách trả lời)
+    pub system_prompt: String,
+}
+
+impl Default for LookupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hotkey: crate::hotkey::DEFAULT.to_string(),
+            model: crate::ai::MODELS[0].0.to_string(),
+            account_id: String::new(),
+            system_prompt: crate::ai::DEFAULT_SYSTEM_PROMPT.to_string(),
         }
     }
 }
@@ -426,9 +455,16 @@ fn value_end(line: &str, from: usize) -> usize {
         .map_or(line.len(), |n| from + n)
 }
 
-/// Chuỗi TOML trong ngoặc kép (thoát dấu \ và ")
+/// Chuỗi TOML trong ngoặc kép (thoát dấu \, ", và xuống dòng để chuỗi nằm trên một dòng)
 fn quoted(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace("\r\n", "\\n")
+        .replace('\n', "\\n")
+        .replace('\r', "")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
 }
 
 impl fmt::Display for Color {
@@ -494,6 +530,15 @@ impl Config {
                 self.alerts.notifications.to_string(),
             ),
             ("alerts", "seconds", self.alerts.seconds.to_string()),
+            ("lookup", "enabled", self.lookup.enabled.to_string()),
+            ("lookup", "hotkey", quoted(&self.lookup.hotkey)),
+            ("lookup", "model", quoted(&self.lookup.model)),
+            ("lookup", "account_id", quoted(&self.lookup.account_id)),
+            (
+                "lookup",
+                "system_prompt",
+                quoted(&self.lookup.system_prompt),
+            ),
         ]
     }
 }
@@ -682,6 +727,22 @@ delay_seconds = 0",
             set_value(text, "font", "family", "\"X\""),
             "[font]\nfamily = \"X\" # chú thích\n"
         );
+    }
+
+    #[test]
+    fn multiline_system_prompt_survives_saving() {
+        let mut c = Config::default();
+        c.lookup.enabled = true;
+        c.lookup.account_id = "abc123".into();
+        c.lookup.system_prompt = "Dòng 1\nDòng \"2\"\r\n\tDòng 3 \\ hết".into();
+        let text = with_config(DEFAULT_TOML, &c);
+        let back = Config::parse(&text).unwrap();
+        assert_eq!(
+            back.lookup.system_prompt,
+            "Dòng 1\nDòng \"2\"\n\tDòng 3 \\ hết"
+        );
+        assert_eq!(back.lookup.account_id, "abc123");
+        assert!(back.lookup.enabled);
     }
 
     #[test]

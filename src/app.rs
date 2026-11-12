@@ -12,8 +12,15 @@ use windows::{
         Foundation::HWND,
         Graphics::Gdi::{CreateRectRgn, SetWindowRgn},
         UI::{
-            Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
-            WindowsAndMessaging::{KillTimer, SW_HIDE, SW_SHOWNOACTIVATE, SetTimer, ShowWindow},
+            Input::KeyboardAndMouse::{
+                GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL,
+                VK_DELETE, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
+                VK_RIGHT, VK_UP,
+            },
+            WindowsAndMessaging::{
+                GWL_EXSTYLE, GetWindowLongPtrW, KillTimer, SW_HIDE, SW_SHOWNOACTIVATE, SetTimer,
+                SetWindowLongPtrW, ShowWindow, WS_EX_NOACTIVATE,
+            },
         },
     },
     core::Result,
@@ -23,15 +30,17 @@ use crate::alerts::{self, Alert};
 use crate::animation::{LineSlide, Spring};
 use crate::backdrop::Backdrop;
 use crate::clipboard::{self, Clip};
-use crate::config::{AutoHideConfig, ClockConfig, Color, Config};
+use crate::config::{AutoHideConfig, ClockConfig, Color, Config, LookupConfig};
 use crate::content::{self, Content, Page};
-use crate::graphics::{AlertView, CompactLyric, Frame, Graphics};
+use crate::graphics::{AlertView, CompactLyric, Frame, Graphics, LookupView};
 use crate::icon::Icon;
-use crate::layout::{BUTTON_COUNT, Expanded, LYRICS_BUTTON, Layout};
+use crate::layout::{BUTTON_COUNT, Expanded, LOOKUP_ROWS_MAX, LYRICS_BUTTON, Layout};
+use crate::lookup::{self, History, Suggestion};
 use crate::media::{self, MediaCommand};
 use crate::meter::{Meter, Wave};
 use crate::palette;
 use crate::settings;
+use crate::{ai, secret};
 
 /// Một nấc con lăn chuột (WHEEL_DELTA); touchpad gửi nhiều số nhỏ cộng dồn lại
 const WHEEL_NOTCH: i32 = 120;
@@ -45,6 +54,10 @@ const LYRICS_TICK_MS: u32 = 150;
 const KARAOKE_TICK_MS: u32 = 33;
 /// Sóng nhạc trên trang Media Player: vẽ lại ~25 lần mỗi giây
 const WAVE_TICK_MS: u32 = 40;
+/// Hộp Tra cứu nhanh: nhịp nhấp nháy của con trỏ (và ba chấm "Đang trả lời")
+const LOOKUP_TICK_MS: u32 = 500;
+/// Mỗi nấc con lăn cuộn khung chat bao nhiêu điểm ảnh
+const CHAT_SCROLL_STEP: f32 = 40.0;
 /// Timer hết giờ hiện thông báo tạm thời
 pub const TIMER_ALERT: usize = 3;
 /// Timer chờ clipboard ổn định: một lần sao chép, app nguồn có thể ghi nhiều đợt liền nhau
@@ -129,6 +142,17 @@ pub struct App {
     /// Mức âm thanh đang phát, và các vạch sóng nhạc vẽ từ đó
     meter: Meter,
     wave: Wave,
+    /// Tra cứu nhanh: cấu hình (None nếu tắt trong Cài đặt), hộp đang mở không,
+    /// cuộc trò chuyện (giữ cả khi đóng hộp), lịch sử, các dòng gợi ý đang hiện
+    lookup_config: Option<LookupConfig>,
+    lookup_open: bool,
+    lookup_configured: bool,
+    lookup: lookup::Session,
+    history: History,
+    suggestions: Vec<Suggestion>,
+    caret_on: bool,
+    /// Chuột đang ở dòng gợi ý nào / trên nút "Mới"
+    lookup_hover: (Option<usize>, bool),
 }
 
 impl App {
@@ -159,6 +183,18 @@ impl App {
             cover_accent: None,
             meter: Meter::start(),
             wave: Wave::default(),
+            lookup_config: config.lookup.enabled.then(|| config.lookup.clone()),
+            lookup_open: false,
+            lookup_configured: false,
+            lookup: lookup::Session::default(),
+            history: if config.lookup.enabled {
+                History::load()
+            } else {
+                History::default()
+            },
+            suggestions: Vec::new(),
+            caret_on: true,
+            lookup_hover: (None, false),
             keep_tall: false,
             width: Spring::new(layout.collapsed.0),
             height: Spring::new(layout.collapsed.1),
@@ -249,6 +285,14 @@ impl App {
             cover: self.cover.as_ref().map(|(_, bitmap)| bitmap),
             cover_accent: self.cover_accent,
             wave: &self.wave,
+            lookup: self.lookup_open.then(|| LookupView {
+                session: &self.lookup,
+                suggestions: &self.suggestions,
+                caret_on: self.caret_on,
+                configured: self.lookup_configured,
+                hover_row: self.lookup_hover.0,
+                hover_new: self.lookup_hover.1,
+            }),
             alert: self.alert.as_ref().map(|a| AlertView {
                 alert: &a.alert,
                 icon: a.icon.as_ref(),
@@ -374,7 +418,10 @@ impl App {
 
     /// Kích thước island nên có theo trạng thái hiện tại
     fn target_size(&self) -> (f32, f32) {
-        if self.alert_active() {
+        if self.lookup_open {
+            // Hộp Tra cứu nhanh mở cho tới khi người dùng đóng, không phụ thuộc chuột
+            self.layout.expanded_size(Expanded::Lookup)
+        } else if self.alert_active() {
             // Thông báo tạm thời được ưu tiên, kể cả khi đang rê chuột (để đọc cho kịp)
             self.layout.alert_size()
         } else if self.hovered {
@@ -449,9 +496,10 @@ impl App {
             self.wake(hwnd);
         }
         let playing = self.content.playing && !self.content.title.is_empty();
-        if configuring || self.autohide.in_use(self.hovered, playing) {
+        if configuring || self.lookup_open || self.autohide.in_use(self.hovered, playing) {
             self.last_active = Instant::now();
         } else if !self.notch && self.autohide.is_due(self.last_active.elapsed()) {
+            crate::trace::log("không dùng một lúc: thu nhỏ thành notch (vạch nhỏ)");
             self.notch = true;
             self.retarget(hwnd);
         }
@@ -493,7 +541,9 @@ impl App {
         if !wave {
             self.wave = Wave::default();
         }
-        let want = if wave {
+        let want = if self.lookup_open {
+            Some(LOOKUP_TICK_MS)
+        } else if wave {
             Some(WAVE_TICK_MS)
         } else {
             self.lyrics_live().then_some(if self.hovered {
@@ -563,6 +613,14 @@ impl App {
         let (w, h) = self.hit_size();
         let inside = self.layout.island_contains(w, h, x, y);
         self.set_hovered(hwnd, inside);
+        if self.lookup_open {
+            let hover = self.lookup_hover_at(x, y);
+            if hover != self.lookup_hover {
+                self.lookup_hover = hover;
+                self.redraw_if_idle();
+            }
+            return;
+        }
 
         let hover_button = if self.buttons_active() {
             self.layout
@@ -585,6 +643,10 @@ impl App {
     }
 
     pub fn on_click(&mut self, hwnd: HWND, x: i32, y: i32) {
+        if self.lookup_open {
+            self.on_lookup_click(hwnd, x as f32, y as f32);
+            return;
+        }
         // Bấm vào thông báo tạm thời: đóng nó (rồi hiện cái kế tiếp nếu có)
         if self.alert_active() {
             self.close_alert(hwnd);
@@ -632,6 +694,15 @@ impl App {
 
     /// Lăn chuột trên island: lăn xuống sang trang sau, lăn lên về trang trước
     pub fn on_wheel(&mut self, hwnd: HWND, delta: i16) {
+        if self.lookup_open {
+            // Lăn lên (delta dương) để xem câu cũ hơn
+            let body = self.layout.lookup_body();
+            let max = (self.graphics.chat_height(&self.lookup) - (body.bottom - body.top)).max(0.0);
+            let step = f32::from(delta) / WHEEL_NOTCH as f32 * CHAT_SCROLL_STEP;
+            self.lookup.scroll = (self.lookup.scroll + step).clamp(0.0, max);
+            self.redraw_if_idle();
+            return;
+        }
         self.wheel += i32::from(delta);
         if self.wheel.abs() >= WHEEL_NOTCH {
             let forward = self.wheel < 0;
@@ -643,8 +714,13 @@ impl App {
     /// Gọi mỗi giây: ẩn/hiện theo chế độ toàn màn hình, tự ẩn thành notch, cập nhật đồng hồ
     pub fn on_timer(&mut self, hwnd: HWND, fullscreen: bool) {
         if fullscreen != self.hidden {
+            crate::trace::log(format!(
+                "toàn màn hình = {fullscreen}: island {}",
+                if fullscreen { "ẩn" } else { "hiện lại" }
+            ));
             self.hidden = fullscreen;
             if fullscreen {
+                self.close_lookup(hwnd);
                 // Đang xem phim, chơi game: bỏ hết thông báo tạm thời, không làm phiền
                 self.alert_queue.clear();
                 self.alert = None;
@@ -683,6 +759,11 @@ impl App {
 
     /// Timer nhanh: sóng nhạc nhảy theo âm thanh; lời thì chỉ vẽ lại khi dòng lời đổi
     pub fn on_lyrics_tick(&mut self, hwnd: HWND) {
+        if self.lookup_open {
+            self.caret_on = !self.caret_on;
+            self.redraw_if_idle();
+            return;
+        }
         if self.wave_live() {
             self.wave.push(self.meter.level());
             self.redraw_if_idle();
@@ -736,6 +817,244 @@ impl App {
         self.redraw_if_idle();
     }
 
+    // ---------- Tra cứu nhanh ----------
+
+    /// Phím tắt cần đăng ký (None nếu tắt Tra cứu nhanh)
+    pub fn lookup_hotkey(&self) -> Option<&str> {
+        self.lookup_config.as_ref().map(|c| c.hotkey.as_str())
+    }
+
+    /// Phím tắt: đang đóng thì mở, đang mở thì đóng. Trả về true nếu vừa mở: khi đó
+    /// main.rs đưa island lên trước để nhận bàn phím (không làm ở đây, vì Windows gửi ngay
+    /// WM_ACTIVATE về cửa sổ trong lúc app còn đang được mượn)
+    pub fn toggle_lookup(&mut self, hwnd: HWND) -> bool {
+        if self.lookup_open {
+            self.close_lookup(hwnd);
+        } else {
+            self.open_lookup(hwnd);
+        }
+        self.lookup_open
+    }
+
+    /// Đang ẩn vì có app toàn màn hình?
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// Mở hộp (chọn từ menu); đang mở rồi thì giữ nguyên. Trả về true nếu hộp đang mở
+    pub fn open_lookup_now(&mut self, hwnd: HWND) -> bool {
+        if !self.lookup_open {
+            self.open_lookup(hwnd);
+        }
+        self.lookup_open
+    }
+
+    /// Cho island nhận bàn phím (bình thường island không bao giờ giành focus của app khác)
+    fn set_activatable(hwnd: HWND, on: bool) {
+        unsafe {
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let ex = if on {
+                ex & !(WS_EX_NOACTIVATE.0 as isize)
+            } else {
+                ex | WS_EX_NOACTIVATE.0 as isize
+            };
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+        }
+    }
+
+    fn open_lookup(&mut self, hwnd: HWND) {
+        let Some(config) = &self.lookup_config else {
+            crate::trace::log("không mở: Tra cứu nhanh đang tắt");
+            return;
+        };
+        if self.hidden {
+            crate::trace::log("không mở: island đang ẩn vì có app toàn màn hình");
+            return; // đang chơi game, xem phim toàn màn hình
+        }
+        crate::trace::log("mở hộp Tra cứu nhanh");
+        self.lookup_configured =
+            ai::fake() || (!config.account_id.trim().is_empty() && secret::has_token());
+        self.lookup_open = true;
+        self.caret_on = true;
+        self.lookup_hover = (None, false);
+        self.refresh_suggestions(hwnd);
+        // Đang hiện thông báo thì tắt luôn, hộp tra cứu được ưu tiên
+        self.alert = None;
+        self.alert_queue.clear();
+        self.notch = false;
+        self.last_active = Instant::now();
+        Self::set_activatable(hwnd, true);
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_ALERT);
+        }
+        self.retarget(hwnd);
+        self.update_fast_timer(hwnd);
+        self.redraw_if_idle();
+    }
+
+    pub fn close_lookup(&mut self, hwnd: HWND) {
+        if !self.lookup_open {
+            return;
+        }
+        crate::trace::log("đóng hộp Tra cứu nhanh");
+        self.lookup_open = false;
+        self.lookup_hover = (None, false);
+        Self::set_activatable(hwnd, false);
+        self.retarget(hwnd);
+        self.update_fast_timer(hwnd);
+        self.redraw_if_idle();
+    }
+
+    /// Dòng gợi ý dưới ô nhập: clipboard (đọc lại mỗi lần mở) và lịch sử
+    fn refresh_suggestions(&mut self, hwnd: HWND) {
+        // Bản debug: ISLAND_FAKE_CLIPBOARD thay cho clipboard thật (thử giao diện, chụp màn hình)
+        let fake = cfg!(debug_assertions)
+            .then(|| std::env::var("ISLAND_FAKE_CLIPBOARD").ok())
+            .flatten();
+        let clip = fake.or_else(|| clipboard::current_text(hwnd));
+        self.suggestions = lookup::suggestions(clip.as_deref(), &self.history, LOOKUP_ROWS_MAX);
+    }
+
+    /// Gửi câu hỏi cho AI trên luồng nền và ghi vào lịch sử
+    fn send_question(&mut self, hwnd: HWND, request: Option<(u64, String, Vec<ai::Message>)>) {
+        let (Some((id, question, chat)), Some(config)) = (request, &self.lookup_config) else {
+            return;
+        };
+        self.history.push(&question);
+        let settings = ai::Settings {
+            account_id: config.account_id.clone(),
+            token: secret::load_token().unwrap_or_default(),
+            model: config.model.clone(),
+            system_prompt: config.system_prompt.clone(),
+        };
+        lookup::ask_async(hwnd.0 as isize, id, settings, chat);
+        self.update_fast_timer(hwnd);
+        self.redraw_if_idle();
+    }
+
+    /// Dòng gợi ý / nút "Mới" dưới chuột
+    fn lookup_hover_at(&self, x: f32, y: f32) -> (Option<usize>, bool) {
+        if self.lookup.turns.is_empty() {
+            let rows = if self.lookup_configured {
+                self.suggestions.len()
+            } else {
+                0
+            };
+            (self.layout.lookup_row_at(x, y, rows), false)
+        } else {
+            (None, self.layout.lookup_new_hit(x, y))
+        }
+    }
+
+    fn on_lookup_click(&mut self, hwnd: HWND, x: f32, y: f32) {
+        match self.lookup_hover_at(x, y) {
+            (_, true) => {
+                self.lookup.new_chat();
+                self.refresh_suggestions(hwnd);
+                self.lookup_hover = (None, false);
+                self.redraw_if_idle();
+            }
+            (Some(i), _) => {
+                if let Some(s) = self.suggestions.get(i).cloned() {
+                    let request = self.lookup.ask(s.text);
+                    self.lookup.editor.clear();
+                    self.lookup_hover = (None, false);
+                    self.send_question(hwnd, Some(request));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Phím bấm khi hộp Tra cứu nhanh đang mở; false = không xử lý (để Windows làm tiếp)
+    pub fn on_key(&mut self, hwnd: HWND, vk: u16) -> bool {
+        if !self.lookup_open {
+            return false;
+        }
+        crate::trace::log(format!("phím {vk:#x}"));
+        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+        let editor = &mut self.lookup.editor;
+        match vk {
+            v if v == VK_ESCAPE.0 => {
+                self.close_lookup(hwnd);
+                return true;
+            }
+            v if v == VK_RETURN.0 => {
+                let request = self.lookup.submit();
+                self.send_question(hwnd, request);
+            }
+            v if v == VK_BACK.0 && ctrl => editor.backspace_word(),
+            v if v == VK_BACK.0 => editor.backspace(),
+            v if v == VK_DELETE.0 => editor.delete(),
+            v if v == VK_LEFT.0 => editor.left(),
+            v if v == VK_RIGHT.0 => editor.right(),
+            v if v == VK_HOME.0 => editor.home(),
+            v if v == VK_END.0 => editor.end(),
+            // Mũi tên lên khi ô trống: lấy lại câu vừa hỏi để sửa
+            v if v == VK_UP.0 && editor.is_empty() => {
+                if let Some(last) = self.history.items.first() {
+                    editor.set(last);
+                }
+            }
+            v if v == VK_PRIOR.0 => return self.scroll_chat(1.0),
+            v if v == VK_NEXT.0 => return self.scroll_chat(-1.0),
+            v if ctrl && v == u16::from(b'V') => {
+                if let Some(text) = clipboard::current_text(hwnd) {
+                    editor.insert_str(&text);
+                }
+            }
+            // Ctrl+C: chép câu trả lời gần nhất
+            v if ctrl && v == u16::from(b'C') => {
+                if let Some(answer) = self.lookup.last_answer() {
+                    clipboard::set_text(hwnd, answer);
+                }
+            }
+            v if ctrl && v == u16::from(b'N') => {
+                self.lookup.new_chat();
+                self.refresh_suggestions(hwnd);
+            }
+            _ => return false,
+        }
+        self.caret_on = true;
+        self.redraw_if_idle();
+        true
+    }
+
+    /// Cuộn khung chat một trang (PageUp: 1, PageDown: -1)
+    fn scroll_chat(&mut self, pages: f32) -> bool {
+        let body = self.layout.lookup_body();
+        let page = body.bottom - body.top - 20.0;
+        let max = (self.graphics.chat_height(&self.lookup) - (body.bottom - body.top)).max(0.0);
+        self.lookup.scroll = (self.lookup.scroll + pages * page).clamp(0.0, max);
+        self.redraw_if_idle();
+        true
+    }
+
+    /// Ký tự gõ vào (đã qua bộ gõ tiếng Việt). Ký tự điều khiển (Backspace, Enter, Ctrl+V...)
+    /// đã được `on_key` xử lý
+    pub fn on_char(&mut self, unit: u16) {
+        if !self.lookup_open || unit < 0x20 || unit == 0x7F {
+            return;
+        }
+        self.lookup.editor.push_utf16(unit);
+        self.caret_on = true;
+        self.redraw_if_idle();
+    }
+
+    /// Bấm sang cửa sổ khác: đóng hộp (cuộc trò chuyện vẫn giữ, mở lại là thấy)
+    pub fn on_focus_lost(&mut self, hwnd: HWND) {
+        self.close_lookup(hwnd);
+    }
+
+    /// AI trả lời xong
+    pub fn on_lookup_done(&mut self, hwnd: HWND) {
+        for (id, result) in lookup::take_results() {
+            self.lookup.finish(id, result);
+        }
+        self.update_fast_timer(hwnd);
+        self.redraw_if_idle();
+    }
+
     // ---------- Thông báo tạm thời ----------
 
     /// Windows báo clipboard đổi: chờ một chút cho app nguồn ghi xong rồi mới đọc
@@ -763,7 +1082,8 @@ impl App {
     /// Luồng nền báo có thông báo mới
     pub fn on_alerts(&mut self, hwnd: HWND) {
         let fresh = alerts::take();
-        if self.hidden {
+        // Đang xem phim, hoặc đang gõ trong hộp Tra cứu nhanh: không làm phiền
+        if self.hidden || self.lookup_open {
             return;
         }
         for alert in fresh {

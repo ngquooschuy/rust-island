@@ -8,11 +8,11 @@ use std::path::PathBuf;
 
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HGLOBAL, HWND},
+        Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND},
         Graphics::Gdi::*,
         System::{
             DataExchange::*,
-            Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+            Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
             Ole::{CF_BITMAP, CF_HDROP, CF_UNICODETEXT},
             Threading::{
                 GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32,
@@ -289,6 +289,55 @@ fn open(hwnd: HWND) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     false
+}
+
+/// Chữ đang có trong clipboard, cho Tra cứu nhanh. None nếu không phải chữ, hoặc là nội
+/// dung nhạy cảm (mật khẩu từ trình quản lý mật khẩu)
+pub fn current_text(hwnd: HWND) -> Option<String> {
+    if has_format(&w!("ExcludeClipboardContentFromMonitorProcessing")) || !open(hwnd) {
+        return None;
+    }
+    let text = if is_private() { None } else { read_text() };
+    unsafe {
+        let _ = CloseClipboard();
+    }
+    text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+/// Ghi chữ vào clipboard (sao chép câu trả lời của AI). Island không tự hiện thông báo
+/// cho lần sao chép này vì `read` bỏ qua nội dung do chính island sao chép
+pub fn set_text(hwnd: HWND, text: &str) -> bool {
+    let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    let bytes = wide.len() * 2;
+    if !open(hwnd) {
+        return false;
+    }
+    let ok = unsafe {
+        let _ = EmptyClipboard();
+        match GlobalAlloc(GMEM_MOVEABLE, bytes) {
+            Ok(global) => {
+                let ptr = GlobalLock(global) as *mut u16;
+                if ptr.is_null() {
+                    let _ = GlobalFree(Some(global));
+                    false
+                } else {
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+                    let _ = GlobalUnlock(global);
+                    // Thành công thì Windows giữ khối nhớ; thất bại thì phải tự giải phóng
+                    let set = SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(global.0)));
+                    if set.is_err() {
+                        let _ = GlobalFree(Some(global));
+                    }
+                    set.is_ok()
+                }
+            }
+            Err(_) => false,
+        }
+    };
+    unsafe {
+        let _ = CloseClipboard();
+    }
+    ok
 }
 
 /// Đọc lần sao chép mới nhất. None: không có gì đáng hiện, chính island sao chép,

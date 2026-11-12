@@ -21,6 +21,20 @@ const WEATHER_H: f32 = 184.0;
 pub const WEATHER_CARD_H: f32 = 46.0;
 pub const WEATHER_CARD_GAP: f32 = 7.0;
 pub const WEATHER_CARDS_TOP: f32 = 19.0;
+/// Tra cứu nhanh: ô nhập ở trên, câu trả lời / gợi ý ở dưới (cao bằng island lớn nhất)
+const LOOKUP_H: f32 = 248.0;
+/// Ô nhập: lề hai bên, mép trên, chiều cao
+const LOOKUP_PAD: f32 = 18.0;
+const LOOKUP_INPUT_TOP: f32 = 14.0;
+const LOOKUP_INPUT_H: f32 = 40.0;
+/// Nút "Mới" (bắt đầu cuộc trò chuyện mới) nằm trong ô nhập, sát mép phải
+const LOOKUP_NEW_W: f32 = 52.0;
+/// Phần dưới ô nhập: mép trên, khoảng chừa ở đáy, chiều cao mỗi dòng gợi ý
+const LOOKUP_BODY_TOP: f32 = 66.0;
+const LOOKUP_BODY_BOTTOM_PAD: f32 = 16.0;
+const LOOKUP_ROW_H: f32 = 32.0;
+/// Số dòng gợi ý tối đa (nội dung clipboard + lịch sử)
+pub const LOOKUP_ROWS_MAX: usize = 5;
 /// Thông báo tạm thời (vừa sao chép, thông báo Windows): đủ cao cho biểu tượng và 3 dòng chữ
 const ALERT_H: f32 = 84.0;
 /// Island khi tự ẩn: chỉ còn một vạch nhỏ (notch)
@@ -64,6 +78,19 @@ const DOTS_FROM_RIGHT: f32 = 13.0;
 const DOTS_HIT_HALF_LONG: f32 = 24.0;
 const DOTS_HIT_HALF_SHORT: f32 = 9.0;
 
+fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
+    D2D_RECT_F {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
+
+fn contains(r: D2D_RECT_F, x: f32, y: f32) -> bool {
+    x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+}
+
 /// Kiểu mở rộng, mỗi kiểu một chiều cao
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expanded {
@@ -77,6 +104,8 @@ pub enum Expanded {
     Player,
     /// Trang Thời tiết đã có số liệu
     Weather,
+    /// Hộp Tra cứu nhanh
+    Lookup,
 }
 
 /// `Copy` vì chỉ chứa vài con số: truyền đi đâu cũng sao chép, không cần mượn
@@ -103,6 +132,7 @@ impl Layout {
                 .max(LYRICS_H)
                 .max(PLAYER_H)
                 .max(WEATHER_H)
+                .max(LOOKUP_H)
                 + MARGIN_Y) as i32,
             top: window.top,
             collapsed: (window.collapsed_width, COLLAPSED_H),
@@ -148,6 +178,7 @@ impl Layout {
             Expanded::Lyrics => LYRICS_H,
             Expanded::Player => PLAYER_H,
             Expanded::Weather => WEATHER_H,
+            Expanded::Lookup => LOOKUP_H,
         };
         (self.expanded.0, h)
     }
@@ -196,6 +227,57 @@ impl Layout {
         near.then(|| ((x - x0) / (x1 - x0)).clamp(0.0, 1.0))
     }
 
+    /// Ô nhập của Tra cứu nhanh
+    pub fn lookup_input(&self) -> D2D_RECT_F {
+        let (el, right) = self.expanded_edges();
+        rect(
+            el + LOOKUP_PAD,
+            LOOKUP_INPUT_TOP,
+            right - LOOKUP_PAD,
+            LOOKUP_INPUT_TOP + LOOKUP_INPUT_H,
+        )
+    }
+
+    /// Nút "Mới" trong ô nhập
+    pub fn lookup_new_button(&self) -> D2D_RECT_F {
+        let input = self.lookup_input();
+        let cy = (input.top + input.bottom) / 2.0;
+        rect(
+            input.right - 6.0 - LOOKUP_NEW_W,
+            cy - 13.0,
+            input.right - 6.0,
+            cy + 13.0,
+        )
+    }
+
+    /// Vùng câu trả lời / gợi ý bên dưới ô nhập
+    pub fn lookup_body(&self) -> D2D_RECT_F {
+        let (el, right) = self.expanded_edges();
+        rect(
+            el + LOOKUP_PAD,
+            LOOKUP_BODY_TOP,
+            right - LOOKUP_PAD,
+            LOOKUP_H - LOOKUP_BODY_BOTTOM_PAD,
+        )
+    }
+
+    /// Dòng gợi ý thứ `i` (0 = trên cùng)
+    pub fn lookup_row(&self, i: usize) -> D2D_RECT_F {
+        let body = self.lookup_body();
+        let top = body.top + i as f32 * LOOKUP_ROW_H;
+        rect(body.left, top, body.right, top + LOOKUP_ROW_H - 4.0)
+    }
+
+    /// Dòng gợi ý dưới điểm (x, y), xét `count` dòng đầu
+    pub fn lookup_row_at(&self, x: f32, y: f32, count: usize) -> Option<usize> {
+        (0..count.min(LOOKUP_ROWS_MAX)).find(|&i| contains(self.lookup_row(i), x, y))
+    }
+
+    /// Điểm (x, y) trúng nút "Mới"?
+    pub fn lookup_new_hit(&self, x: f32, y: f32) -> bool {
+        contains(self.lookup_new_button(), x, y)
+    }
+
     /// Điểm (x, y) có nằm trong island rộng `w`, cao `h` không?
     pub fn island_contains(&self, w: f32, h: f32, x: f32, y: f32) -> bool {
         let left = self.island_left(w);
@@ -242,12 +324,13 @@ impl Layout {
 mod tests {
     use super::*;
 
-    const KINDS: [Expanded; 5] = [
+    const KINDS: [Expanded; 6] = [
         Expanded::Plain,
         Expanded::Media,
         Expanded::Lyrics,
         Expanded::Player,
         Expanded::Weather,
+        Expanded::Lookup,
     ];
 
     fn layout() -> Layout {
@@ -390,6 +473,36 @@ mod tests {
         let bottom = WEATHER_CARDS_TOP + 3.0 * WEATHER_CARD_H + 2.0 * WEATHER_CARD_GAP;
         assert!(bottom + 12.0 <= h, "thẻ cuối chạm đáy island");
         assert!(h <= l.win_h as f32);
+    }
+
+    #[test]
+    fn lookup_box_fits_and_rows_are_hit_correctly() {
+        for width in [320.0, 400.0, 700.0] {
+            let l = Layout::new(&WindowConfig {
+                expanded_width: width,
+                ..WindowConfig::default()
+            });
+            let (w, h) = l.expanded_size(Expanded::Lookup);
+            assert!(h <= l.win_h as f32);
+            let input = l.lookup_input();
+            assert!(l.island_contains(w, h, input.left, input.top));
+            assert!(l.island_contains(w, h, input.right, input.bottom));
+            // Dòng gợi ý cuối vẫn nằm trong vùng dưới ô nhập
+            let body = l.lookup_body();
+            assert!(l.lookup_row(LOOKUP_ROWS_MAX - 1).bottom <= body.bottom);
+            assert!(body.top > input.bottom);
+            // Nút "Mới" nằm trong ô nhập
+            let new = l.lookup_new_button();
+            assert!(new.left > input.left && new.right < input.right);
+        }
+        let l = layout();
+        let r = l.lookup_row(2);
+        let (x, y) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        assert_eq!(l.lookup_row_at(x, y, 5), Some(2));
+        assert_eq!(l.lookup_row_at(x, y, 2), None); // chỉ có 2 dòng
+        let n = l.lookup_new_button();
+        assert!(l.lookup_new_hit(n.left + 2.0, n.top + 2.0));
+        assert!(!l.lookup_new_hit(n.left - 10.0, n.top + 2.0));
     }
 
     #[test]

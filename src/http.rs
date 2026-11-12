@@ -1,4 +1,5 @@
-//! HTTP GET nhỏ gọn bằng WinHTTP có sẵn trong Windows (dùng cho thời tiết và lời bài hát).
+//! HTTP nhỏ gọn bằng WinHTTP có sẵn trong Windows: GET cho thời tiết và lời bài hát,
+//! POST JSON cho trợ lý AI.
 //!
 //! Không dùng HttpClient của WinRT: với ứng dụng desktop không đóng gói nó báo
 //! lỗi chứng chỉ 0x80072F8F, trong khi WinHTTP dùng chung tầng TLS với cả hệ thống.
@@ -9,6 +10,9 @@ use windows::{
     Win32::Networking::WinHttp::*,
     core::{HSTRING, PCWSTR, w},
 };
+
+/// Chờ trợ lý AI trả lời tối đa bao lâu (mili giây)
+const AI_RECEIVE_TIMEOUT_MS: i32 = 90_000;
 
 /// Handle của WinHTTP, tự đóng khi ra khỏi phạm vi (RAII, giống `File` của Rust)
 struct Handle(*mut c_void);
@@ -73,6 +77,37 @@ impl Session {
 
     /// GET một địa chỉ https; trả về cả khi máy chủ báo lỗi (404...) để bên gọi tự xử lý
     pub fn get(&self, url: &str) -> Result<Response, String> {
+        self.send(w!("GET"), url, "", &[], None)
+    }
+
+    /// POST nội dung JSON kèm header Authorization. AI cần thời gian "suy nghĩ" nên chờ
+    /// câu trả lời lâu hơn GET thường
+    pub fn post_json(
+        &self,
+        url: &str,
+        authorization: &str,
+        json: &str,
+    ) -> Result<Response, String> {
+        let headers =
+            format!("Content-Type: application/json\r\nAuthorization: {authorization}\r\n");
+        self.send(
+            w!("POST"),
+            url,
+            &headers,
+            json.as_bytes(),
+            Some(AI_RECEIVE_TIMEOUT_MS),
+        )
+    }
+
+    /// Gửi một request https; `headers` dạng "Tên: giá trị\r\n..." (rỗng = không thêm)
+    fn send(
+        &self,
+        method: PCWSTR,
+        url: &str,
+        headers: &str,
+        body: &[u8],
+        receive_timeout_ms: Option<i32>,
+    ) -> Result<Response, String> {
         let (host, path) = split_url(url).ok_or("URL không hợp lệ")?;
         let err = |e: windows::core::Error| e.to_string();
         unsafe {
@@ -85,14 +120,21 @@ impl Session {
             ))?;
             let request = Handle::new(WinHttpOpenRequest(
                 connect.0,
-                w!("GET"),
+                method,
                 &HSTRING::from(path),
                 PCWSTR::null(),
                 PCWSTR::null(),
                 std::ptr::null(),
                 WINHTTP_FLAG_SECURE,
             ))?;
-            WinHttpSendRequest(request.0, None, None, 0, 0, 0).map_err(err)?;
+            if let Some(ms) = receive_timeout_ms {
+                let _ = WinHttpSetTimeouts(request.0, 10_000, 10_000, 30_000, ms);
+            }
+            let headers: Vec<u16> = headers.encode_utf16().collect();
+            let headers = (!headers.is_empty()).then_some(headers.as_slice());
+            let length = body.len() as u32;
+            let data = (!body.is_empty()).then_some(body.as_ptr().cast::<c_void>());
+            WinHttpSendRequest(request.0, headers, data, length, length, 0).map_err(err)?;
             WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(err)?;
 
             let mut status = 0u32;
