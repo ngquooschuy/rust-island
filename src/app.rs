@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use windows::{
     Win32::Graphics::Direct2D::ID2D1Bitmap1,
     Win32::{
-        Foundation::HWND,
-        Graphics::Gdi::{CreateRectRgn, SetWindowRgn},
+        Foundation::{HWND, POINT},
+        Graphics::Gdi::{CreateRectRgn, ScreenToClient, SetWindowRgn},
         UI::{
             Input::KeyboardAndMouse::{
                 GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL,
@@ -18,8 +18,8 @@ use windows::{
                 VK_RIGHT, VK_UP,
             },
             WindowsAndMessaging::{
-                GWL_EXSTYLE, GetWindowLongPtrW, KillTimer, SW_HIDE, SW_SHOWNOACTIVATE, SetTimer,
-                SetWindowLongPtrW, ShowWindow, WS_EX_NOACTIVATE,
+                GWL_EXSTYLE, GetCursorPos, GetWindowLongPtrW, KillTimer, SW_HIDE,
+                SW_SHOWNOACTIVATE, SetTimer, SetWindowLongPtrW, ShowWindow, WS_EX_NOACTIVATE,
             },
         },
     },
@@ -56,6 +56,8 @@ const KARAOKE_TICK_MS: u32 = 33;
 const WAVE_TICK_MS: u32 = 40;
 /// Hộp Tra cứu nhanh: nhịp nhấp nháy của con trỏ (và ba chấm "Đang trả lời")
 const LOOKUP_TICK_MS: u32 = 500;
+/// Đóng hộp Tra cứu nhanh: giữ trang mở rộng (đồng hồ, thời tiết) ít nhất bao lâu
+const CLOSE_HOLD: Duration = Duration::from_secs(3);
 /// Mỗi nấc con lăn cuộn khung chat bao nhiêu điểm ảnh
 const CHAT_SCROLL_STEP: f32 = 40.0;
 /// Timer hết giờ hiện thông báo tạm thời
@@ -106,14 +108,15 @@ pub struct App {
     backdrop: Option<Backdrop>,
     clock: ClockConfig,
     autohide: AutoHideConfig,
-    lyrics_enabled: bool,    // bật lời bài hát trong cấu hình?
-    weather_enabled: bool,   // bật thời tiết trong cấu hình? (tắt thì không có trang Thời tiết)
-    show_lyrics: bool,       // đang hiện lời? (nút bên phải hàng nút bật/tắt)
-    lyrics_collapsed: bool,  // hiện câu đang hát trên island thu gọn? (menu chuột phải)
-    slide: LineSlide,        // câu đang hiện trên island thu gọn, có hiệu ứng trượt
-    line_width: f32,         // island thu gọn rộng bao nhiêu để vừa câu đó
-    fast_timer: Option<u32>, // TIMER_LYRICS đang chạy với nhịp bao nhiêu ms (None: tắt)
-    keep_tall: bool,         // vừa tắt lời khi đang rê chuột: giữ chiều cao tới lúc rời chuột
+    lyrics_enabled: bool,        // bật lời bài hát trong cấu hình?
+    weather_enabled: bool,       // bật thời tiết trong cấu hình? (tắt thì không có trang Thời tiết)
+    show_lyrics: bool,           // đang hiện lời? (nút bên phải hàng nút bật/tắt)
+    lyrics_collapsed: bool,      // hiện câu đang hát trên island thu gọn? (menu chuột phải)
+    slide: LineSlide,            // câu đang hiện trên island thu gọn, có hiệu ứng trượt
+    line_width: f32,             // island thu gọn rộng bao nhiêu để vừa câu đó
+    fast_timer: Option<u32>,     // TIMER_LYRICS đang chạy với nhịp bao nhiêu ms (None: tắt)
+    keep_tall: bool,             // vừa tắt lời khi đang rê chuột: giữ chiều cao tới lúc rời chuột
+    close_hold: Option<Instant>, // vừa đóng Tra cứu nhanh: giữ trang mở rộng tới lúc này
     width: Spring,
     height: Spring,
     content: Content,
@@ -196,6 +199,7 @@ impl App {
             caret_on: true,
             lookup_hover: (None, false),
             keep_tall: false,
+            close_hold: None,
             width: Spring::new(layout.collapsed.0),
             height: Spring::new(layout.collapsed.1),
             page: Page::initial(&content),
@@ -596,22 +600,58 @@ impl App {
         self.redraw()
     }
 
-    pub fn on_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
-        if !self.tracking {
-            let mut tme = TRACKMOUSEEVENT {
-                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                dwFlags: TME_LEAVE,
-                hwndTrack: hwnd,
-                dwHoverTime: 0,
-            };
-            unsafe {
-                let _ = TrackMouseEvent(&mut tme);
+    /// Hết giờ giữ trang mở rộng sau khi đóng Tra cứu nhanh chưa?
+    fn close_hold_over(&self) -> bool {
+        self.close_hold.is_some_and(|until| Instant::now() >= until)
+    }
+
+    /// Con trỏ chuột có đang nằm trên island không (khi không có WM_MOUSEMOVE để biết)
+    fn cursor_inside(&self, hwnd: HWND) -> bool {
+        let mut pt = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut pt).is_err() || !ScreenToClient(hwnd, &mut pt).as_bool() {
+                return false;
             }
-            self.tracking = true;
         }
+        let (w, h) = self.hit_size();
+        self.layout.island_contains(w, h, pt.x as f32, pt.y as f32)
+    }
+
+    /// Nhờ Windows báo WM_MOUSELEAVE khi con trỏ rời cửa sổ
+    fn track_leave(&mut self, hwnd: HWND) {
+        if self.tracking {
+            return;
+        }
+        let mut tme = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        unsafe {
+            let _ = TrackMouseEvent(&mut tme);
+        }
+        self.tracking = true;
+    }
+
+    pub fn on_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
+        self.track_leave(hwnd);
         let (x, y) = (x as f32, y as f32);
         let (w, h) = self.hit_size();
         let inside = self.layout.island_contains(w, h, x, y);
+        if self.close_hold.is_some() {
+            // Vừa đóng Tra cứu nhanh: con trỏ còn nằm chỗ hộp to vừa ở, ngoài trang mở rộng.
+            // Rê ở đó thì bỏ qua để trang mở rộng không thu lại ngay; rê vào island thì
+            // từ đó theo luật rê chuột như thường. So với kích thước đích, không phải khung
+            // đang co dở (lúc co lại khung còn to, con trỏ ở đâu cũng như nằm trong)
+            let on_island =
+                self.layout
+                    .island_contains(self.width.target, self.height.target, x, y);
+            if !on_island && !self.close_hold_over() {
+                return;
+            }
+            self.close_hold = None;
+        }
         self.set_hovered(hwnd, inside);
         if self.lookup_open {
             let hover = self.lookup_hover_at(x, y);
@@ -639,6 +679,10 @@ impl App {
     pub fn on_mouse_leave(&mut self, hwnd: HWND) {
         self.tracking = false;
         self.hover_button = None;
+        if self.close_hold.is_some() && !self.close_hold_over() {
+            return; // còn đang giữ trang mở rộng sau khi đóng Tra cứu nhanh
+        }
+        self.close_hold = None;
         self.set_hovered(hwnd, false);
     }
 
@@ -738,6 +782,16 @@ impl App {
         if self.hidden {
             self.update_fast_timer(hwnd);
             return; // đang ẩn vì toàn màn hình: không vẽ, không đếm giờ
+        }
+        if self.close_hold_over() {
+            // Hết giờ giữ trang mở rộng sau khi đóng Tra cứu nhanh: con trỏ không nằm trên
+            // island thì thu gọn, còn nằm trên thì theo dõi để biết lúc nó rời đi
+            self.close_hold = None;
+            let inside = self.cursor_inside(hwnd);
+            if inside {
+                self.track_leave(hwnd);
+            }
+            self.set_hovered(hwnd, inside);
         }
         self.update_auto_hide(hwnd);
         self.update_fast_timer(hwnd);
@@ -875,6 +929,7 @@ impl App {
         self.lookup_configured =
             ai::fake() || (!config.account_id.trim().is_empty() && secret::has_token());
         self.lookup_open = true;
+        self.close_hold = None;
         self.caret_on = true;
         self.lookup_hover = (None, false);
         self.refresh_suggestions(hwnd);
@@ -899,13 +954,18 @@ impl App {
         crate::trace::log("đóng hộp Tra cứu nhanh");
         self.lookup_open = false;
         self.lookup_hover = (None, false);
-        // Đóng là thu thẳng về island thu gọn. Hộp to nên con trỏ thường đang nằm trong nó:
-        // không bỏ trạng thái rê chuột thì island dừng ở trang mở rộng rồi mới thu lại.
-        // Rê chuột lên island lần nữa thì nó mở rộng như thường
-        self.hovered = false;
         self.keep_tall = false;
         self.hover_button = None;
         Self::set_activatable(hwnd, false);
+        if !self.hidden {
+            // Đóng là về trang mở rộng có đồng hồ và thời tiết, giữ ít nhất CLOSE_HOLD dù con
+            // trỏ ở đâu (thường đóng bằng phím, chuột không nằm trên island); hết giờ thì theo
+            // luật rê chuột như thường
+            self.hovered = true;
+            self.close_hold = Some(Instant::now() + CLOSE_HOLD);
+            self.last_active = Instant::now();
+            self.set_page(hwnd, Page::Idle);
+        }
         self.retarget(hwnd);
         self.update_fast_timer(hwnd);
         self.redraw_if_idle();
