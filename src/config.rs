@@ -26,7 +26,12 @@ pub struct Config {
     pub autohide: AutoHideConfig,
     pub lyrics: LyricsConfig,
     pub alerts: AlertsConfig,
-    pub lookup: LookupConfig,
+    pub ai: AiConfig,
+    /// Mục [lookup] của tính năng Tra cứu nhanh đã bỏ. File cấu hình cũ còn mục này thì đọc
+    /// (để chuyển Account ID, model, lời dặn sang [ai]) rồi bỏ qua; không khai báo thì
+    /// `deny_unknown_fields` báo lỗi và người dùng mất hết cấu hình
+    #[serde(rename = "lookup")]
+    retired_lookup: Option<toml::Table>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -180,14 +185,11 @@ impl Default for AlertsConfig {
     }
 }
 
-/// Tra cứu nhanh (Quick Lookup): phím tắt mở hộp hỏi AI ngay trên island.
+/// Trợ lý AI (Cloudflare Workers AI).
 /// API token không nằm ở đây mà trong Windows Credential Manager (xem secret.rs)
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct LookupConfig {
-    pub enabled: bool,
-    /// Ví dụ "Ctrl+Alt+`" (xem hotkey.rs)
-    pub hotkey: String,
+pub struct AiConfig {
     /// Model của Workers AI, ví dụ "@cf/openai/gpt-oss-20b"
     pub model: String,
     /// Account ID của Cloudflare
@@ -196,11 +198,31 @@ pub struct LookupConfig {
     pub system_prompt: String,
 }
 
-impl Default for LookupConfig {
+impl AiConfig {
+    /// Lấy Account ID, model, lời dặn từ mục [lookup] cũ (thiếu trường nào thì dùng mặc định)
+    fn from_retired_lookup(old: &toml::Table) -> Self {
+        let mut ai = Self::default();
+        let text = |key: &str| {
+            old.get(key)
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+        };
+        if let Some(model) = text("model") {
+            ai.model = model;
+        }
+        if let Some(account_id) = text("account_id") {
+            ai.account_id = account_id;
+        }
+        if let Some(prompt) = text("system_prompt") {
+            ai.system_prompt = prompt;
+        }
+        ai
+    }
+}
+
+impl Default for AiConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            hotkey: crate::hotkey::DEFAULT.to_string(),
             model: crate::ai::MODELS[0].0.to_string(),
             account_id: String::new(),
             system_prompt: crate::ai::DEFAULT_SYSTEM_PROMPT.to_string(),
@@ -313,7 +335,17 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
         // Notepad đôi khi lưu kèm BOM ở đầu file; TOML không chấp nhận ký tự đó
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        toml::from_str::<Self>(text).map(Self::sanitized)
+        let mut config = toml::from_str::<Self>(text)?;
+        if let Some(old) = config.retired_lookup.take() {
+            // File từ bản còn Tra cứu nhanh, chưa có mục [ai]: lấy cấu hình AI từ mục cũ
+            let has_ai = text
+                .parse::<toml::Table>()
+                .is_ok_and(|t| t.contains_key("ai"));
+            if !has_ai {
+                config.ai = AiConfig::from_retired_lookup(&old);
+            }
+        }
+        Ok(config.sanitized())
     }
 
     // Số quá lớn/nhỏ sẽ làm vỡ giao diện, nên giới hạn lại
@@ -530,15 +562,9 @@ impl Config {
                 self.alerts.notifications.to_string(),
             ),
             ("alerts", "seconds", self.alerts.seconds.to_string()),
-            ("lookup", "enabled", self.lookup.enabled.to_string()),
-            ("lookup", "hotkey", quoted(&self.lookup.hotkey)),
-            ("lookup", "model", quoted(&self.lookup.model)),
-            ("lookup", "account_id", quoted(&self.lookup.account_id)),
-            (
-                "lookup",
-                "system_prompt",
-                quoted(&self.lookup.system_prompt),
-            ),
+            ("ai", "model", quoted(&self.ai.model)),
+            ("ai", "account_id", quoted(&self.ai.account_id)),
+            ("ai", "system_prompt", quoted(&self.ai.system_prompt)),
         ]
     }
 }
@@ -732,17 +758,32 @@ delay_seconds = 0",
     #[test]
     fn multiline_system_prompt_survives_saving() {
         let mut c = Config::default();
-        c.lookup.enabled = true;
-        c.lookup.account_id = "abc123".into();
-        c.lookup.system_prompt = "Dòng 1\nDòng \"2\"\r\n\tDòng 3 \\ hết".into();
+        c.ai.account_id = "abc123".into();
+        c.ai.system_prompt = "Dòng 1\nDòng \"2\"\r\n\tDòng 3 \\ hết".into();
         let text = with_config(DEFAULT_TOML, &c);
         let back = Config::parse(&text).unwrap();
-        assert_eq!(
-            back.lookup.system_prompt,
-            "Dòng 1\nDòng \"2\"\n\tDòng 3 \\ hết"
-        );
-        assert_eq!(back.lookup.account_id, "abc123");
-        assert!(back.lookup.enabled);
+        assert_eq!(back.ai.system_prompt, "Dòng 1\nDòng \"2\"\n\tDòng 3 \\ hết");
+        assert_eq!(back.ai.account_id, "abc123");
+    }
+
+    #[test]
+    fn retired_lookup_section_moves_to_ai() {
+        // File từ bản còn Tra cứu nhanh: vẫn đọc được, cấu hình AI chuyển sang [ai]
+        let old = "[clock]\nhour24 = false\n\n[lookup]\nenabled = true\nhotkey = \"Ctrl+Alt+`\"\n\
+                   model = \"@cf/openai/gpt-oss-120b\"\naccount_id = \"abc\"\n";
+        let c = Config::parse(old).unwrap();
+        assert!(!c.clock.hour24);
+        assert_eq!(c.ai.account_id, "abc");
+        assert_eq!(c.ai.model, "@cf/openai/gpt-oss-120b");
+        assert_eq!(c.ai.system_prompt, AiConfig::default().system_prompt);
+        // Lưu lại thì có mục [ai]; từ đó [ai] là chuẩn, mục [lookup] cũ bị bỏ qua
+        let saved = with_config(old, &c);
+        assert!(saved.contains("[ai]"));
+        let back = Config::parse(&saved).unwrap();
+        assert_eq!(back, c);
+        let only_ai = Config::parse(&format!("{old}\n[ai]\naccount_id = \"xyz\"\n")).unwrap();
+        assert_eq!(only_ai.ai.account_id, "xyz");
+        assert_eq!(only_ai.ai.model, AiConfig::default().model);
     }
 
     #[test]

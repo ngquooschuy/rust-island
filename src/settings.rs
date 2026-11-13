@@ -24,7 +24,6 @@ use windows::{
 };
 
 use crate::config::{self, BackdropKind, Color, Config};
-use crate::hotkey::{self, Hotkey};
 use crate::{ai, autostart, lyrics, secret};
 
 // Mã số control. Lưu = IDOK và Hủy = IDCANCEL để phím Enter / Esc tự bấm hai nút đó
@@ -63,27 +62,16 @@ const ID_OFFSET_SONG: i32 = 80;
 const ID_OFFSET: i32 = 81;
 const ID_OFFSET_VALUE: i32 = 82;
 const ID_OFFSET_RESET: i32 = 83;
-const ID_LOOKUP: i32 = 90;
-const ID_LOOKUP_HOTKEY: i32 = 91;
-const ID_LOOKUP_HOTKEY_STATUS: i32 = 92;
-const ID_LOOKUP_MODEL: i32 = 93;
-const ID_LOOKUP_ACCOUNT: i32 = 94;
-const ID_LOOKUP_TOKEN: i32 = 95;
-const ID_LOOKUP_TOKEN_CLEAR: i32 = 96;
-const ID_LOOKUP_PROMPT: i32 = 97;
-const ID_LOOKUP_TEST: i32 = 98;
-const ID_LOOKUP_TEST_RESULT: i32 = 99;
+const ID_AI_MODEL: i32 = 93;
+const ID_AI_ACCOUNT: i32 = 94;
+const ID_AI_TOKEN: i32 = 95;
+const ID_AI_TOKEN_CLEAR: i32 = 96;
+const ID_AI_PROMPT: i32 = 97;
+const ID_AI_TEST: i32 = 98;
+const ID_AI_TEST_RESULT: i32 = 99;
 
 /// Luồng "Kiểm tra kết nối" gửi thông điệp này về cửa sổ Cài đặt khi có kết quả
-const WM_LOOKUP_TEST_DONE: u32 = WM_APP + 20;
-// Ô chọn phím tắt của Windows (msctls_hotkey32)
-const HKM_SETHOTKEY: u32 = WM_USER + 1;
-const HKM_GETHOTKEY: u32 = WM_USER + 2;
-const HKM_SETRULES: u32 = WM_USER + 3;
-/// Tổ hợp không hợp lệ: không có phím bổ trợ (1), chỉ có Shift (2)
-const HKCOMB_NONE_OR_SHIFT: usize = 1 | 2;
-/// ...thì tự đổi thành Ctrl+Alt+phím đó (HOTKEYF_CONTROL | HOTKEYF_ALT)
-const HOTKEYF_CONTROL_ALT: isize = 2 | 4;
+const WM_AI_TEST_DONE: u32 = WM_APP + 20;
 /// Chữ mờ gợi ý trong ô nhập (EM_SETCUEBANNER)
 const EM_SETCUEBANNER: u32 = 0x1501;
 
@@ -100,7 +88,7 @@ const TBM_SETPAGESIZE: u32 = WM_USER + 21;
 /// Mã trong WM_HSCROLL báo người dùng đã kéo/bấm xong (thả chuột, nhả phím)
 const TB_ENDTRACK: usize = 8;
 
-/// Kích thước vùng trong cửa sổ, ở tỉ lệ 100% (96 DPI): ba cột, cột phải là Modules
+/// Kích thước vùng trong cửa sổ, ở tỉ lệ 100% (96 DPI): ba cột, cột phải là Trợ lý AI
 const CLIENT: (i32, i32) = (956, 650);
 
 const BACKDROPS: [(BackdropKind, &str); 3] = [
@@ -129,9 +117,6 @@ thread_local! {
     static OFFSET_SONG: RefCell<String> = const { RefCell::new(String::new()) };
     /// 16 màu tự chọn trong hộp chọn màu của Windows, nhớ trong lúc app chạy
     static CUSTOM_COLORS: Cell<[COLORREF; 16]> = const { Cell::new([COLORREF(0xFFFFFF); 16]) };
-    /// Phím tắt lúc mở cửa sổ: (chữ trong file, giá trị ô chọn phím). Ô chọn phím không có
-    /// phím Win, nên nếu người dùng không đổi gì thì giữ nguyên chữ trong file
-    static INITIAL_HOTKEY: RefCell<(String, u16)> = const { RefCell::new((String::new(), 0)) };
 }
 
 /// Kết quả "Kiểm tra kết nối", chờ cửa sổ Cài đặt lấy
@@ -463,18 +448,6 @@ impl Builder {
         self.add(w!("EDIT"), "", style, WS_EX_CLIENTEDGE, (x, y, w, h), id);
     }
 
-    fn hotkey(&self, x: i32, y: i32, w: i32, id: i32) {
-        let style = WS_TABSTOP.0 as i32;
-        self.add(
-            w!("msctls_hotkey32"),
-            "",
-            style,
-            WS_EX_CLIENTEDGE,
-            (x, y, w, 23),
-            id,
-        );
-    }
-
     /// Chữ nhiều dòng (tự xuống dòng), cao `h`
     fn note(&self, text: &str, x: i32, y: i32, w: i32, h: i32, id: i32) {
         self.add(w!("STATIC"), text, 0, WINDOW_EX_STYLE(0), (x, y, w, h), id);
@@ -753,48 +726,31 @@ fn build(b: &Builder) {
     b.edit(502, 562, 44, ID_ALERT_SECONDS, true);
     b.label("giây", 552, 562, 60, -1);
 
-    // ===== Cột thứ ba: Modules =====
-    b.group("Modules", 644, 8, 300, 590);
-    b.check(
-        "Tra cứu nhanh với AI (Quick Lookup)",
-        656,
-        32,
-        280,
-        ID_LOOKUP,
-    );
-    b.label("Phím tắt", 678, 62, 80, -1);
-    b.hotkey(762, 62, 170, ID_LOOKUP_HOTKEY);
-    b.note("", 678, 90, 256, 34, ID_LOOKUP_HOTKEY_STATUS);
-    b.label("Model", 678, 128, 80, -1);
-    b.combo(762, 128, 170, ID_LOOKUP_MODEL);
-    b.label("Account ID", 678, 160, 80, -1);
-    b.edit(762, 160, 170, ID_LOOKUP_ACCOUNT, false);
-    b.label("API token", 678, 192, 80, -1);
-    b.password(762, 192, 170, ID_LOOKUP_TOKEN);
-    b.button(
-        "Xóa token đã lưu",
-        762,
-        222,
-        170,
-        ID_LOOKUP_TOKEN_CLEAR,
-        false,
-    );
+    // ===== Cột thứ ba: Trợ lý AI =====
+    b.group("Trợ lý AI (Cloudflare Workers AI)", 644, 8, 300, 590);
+    b.label("Model", 656, 34, 80, -1);
+    b.combo(740, 32, 192, ID_AI_MODEL);
+    b.label("Account ID", 656, 66, 80, -1);
+    b.edit(740, 64, 192, ID_AI_ACCOUNT, false);
+    b.label("API token", 656, 98, 80, -1);
+    b.password(740, 96, 192, ID_AI_TOKEN);
+    b.button("Xóa token đã lưu", 740, 126, 192, ID_AI_TOKEN_CLEAR, false);
     b.label(
         "Lời dặn cho trợ lý (vai trò, cách trả lời)",
-        678,
-        258,
-        256,
+        656,
+        164,
+        276,
         -1,
     );
-    b.multiline(678, 282, 254, 140, ID_LOOKUP_PROMPT);
-    b.button("Kiểm tra kết nối", 678, 432, 140, ID_LOOKUP_TEST, false);
-    b.note("", 678, 466, 256, 62, ID_LOOKUP_TEST_RESULT);
+    b.multiline(656, 188, 276, 180, ID_AI_PROMPT);
+    b.button("Kiểm tra kết nối", 656, 380, 140, ID_AI_TEST, false);
+    b.note("", 656, 414, 276, 92, ID_AI_TEST_RESULT);
     b.note(
         "Câu hỏi được gửi tới Workers AI của Cloudflare. Token cất trong Windows \
          Credential Manager, không ghi vào file cấu hình.",
-        678,
-        534,
-        256,
+        656,
+        530,
+        276,
         54,
         -1,
     );
@@ -821,20 +777,12 @@ fn build(b: &Builder) {
     }
     send(hwnd, ID_FONT, CB_SETMINVISIBLE, 14, 0);
     for (i, (_, label)) in ai::MODELS.iter().enumerate() {
-        combo_add(hwnd, ID_LOOKUP_MODEL, label, i);
+        combo_add(hwnd, ID_AI_MODEL, label, i);
     }
-    // Ô chọn phím tắt: thiếu Ctrl/Alt thì Windows tự thêm Ctrl+Alt
-    send(
-        hwnd,
-        ID_LOOKUP_HOTKEY,
-        HKM_SETRULES,
-        HKCOMB_NONE_OR_SHIFT,
-        HOTKEYF_CONTROL_ALT,
-    );
     let banner = HSTRING::from("Dán token mới vào đây");
     send(
         hwnd,
-        ID_LOOKUP_TOKEN,
+        ID_AI_TOKEN,
         EM_SETCUEBANNER,
         1,
         banner.as_ptr() as isize,
@@ -908,46 +856,30 @@ fn fill(hwnd: HWND, config: &Config) {
     set_checked(hwnd, ID_ALERT_NOTIFICATIONS, config.alerts.notifications);
     set_text(hwnd, ID_ALERT_SECONDS, &config.alerts.seconds.to_string());
 
-    let lookup = &config.lookup;
-    set_checked(hwnd, ID_LOOKUP, lookup.enabled);
-    let keys = Hotkey::parse(&lookup.hotkey)
-        .or_else(|_| Hotkey::parse(hotkey::DEFAULT))
-        .map_or(0, Hotkey::to_hotkey_control);
-    send(hwnd, ID_LOOKUP_HOTKEY, HKM_SETHOTKEY, usize::from(keys), 0);
-    INITIAL_HOTKEY.set((lookup.hotkey.clone(), keys));
+    let assistant = &config.ai;
     // Model lạ (tự sửa trong file) vẫn giữ, thêm vào cuối danh sách
     let model = ai::MODELS
         .iter()
-        .position(|(id, _)| *id == lookup.model)
-        .unwrap_or_else(|| combo_add(hwnd, ID_LOOKUP_MODEL, &lookup.model, usize::MAX));
-    combo_select(hwnd, ID_LOOKUP_MODEL, model);
-    set_text(hwnd, ID_LOOKUP_ACCOUNT, &lookup.account_id);
-    set_text(hwnd, ID_LOOKUP_TOKEN, "");
+        .position(|(id, _)| *id == assistant.model)
+        .unwrap_or_else(|| combo_add(hwnd, ID_AI_MODEL, &assistant.model, usize::MAX));
+    combo_select(hwnd, ID_AI_MODEL, model);
+    set_text(hwnd, ID_AI_ACCOUNT, &assistant.account_id);
+    set_text(hwnd, ID_AI_TOKEN, "");
     // Ô nhập nhiều dòng của Windows cần \r\n để xuống dòng
     set_text(
         hwnd,
-        ID_LOOKUP_PROMPT,
-        &lookup.system_prompt.replace('\n', "\r\n"),
+        ID_AI_PROMPT,
+        &assistant.system_prompt.replace('\n', "\r\n"),
     );
     update_values(hwnd);
     update_enabled(hwnd);
 }
 
-/// Phím tắt đang chọn trong ô chọn phím, dạng chữ ("Ctrl+Alt+`")
-fn chosen_hotkey(hwnd: HWND) -> Option<String> {
-    let value = send(hwnd, ID_LOOKUP_HOTKEY, HKM_GETHOTKEY, 0, 0) as u16;
-    let (initial_text, initial_value) = INITIAL_HOTKEY.with_borrow(|i| i.clone());
-    if value == initial_value && !initial_text.is_empty() {
-        return Some(initial_text);
-    }
-    Hotkey::from_hotkey_control(value).map(|k| k.to_string())
-}
-
 /// Model đang chọn
 fn chosen_model(hwnd: HWND) -> String {
-    match combo_data(hwnd, ID_LOOKUP_MODEL).and_then(|i| ai::MODELS.get(i)) {
+    match combo_data(hwnd, ID_AI_MODEL).and_then(|i| ai::MODELS.get(i)) {
         Some((id, _)) => id.to_string(),
-        None => text(hwnd, ID_LOOKUP_MODEL), // model tự sửa trong file: nhãn chính là mã model
+        None => text(hwnd, ID_AI_MODEL), // model tự sửa trong file: nhãn chính là mã model
     }
 }
 
@@ -976,20 +908,6 @@ fn read(hwnd: HWND) -> Result<Config, &'static str> {
     let weather = checked(hwnd, ID_WEATHER);
     if weather && city.is_empty() {
         return Err("Hãy nhập tên thành phố để xem thời tiết.");
-    }
-    let lookup = checked(hwnd, ID_LOOKUP);
-    let account_id = text(hwnd, ID_LOOKUP_ACCOUNT).trim().to_string();
-    let hotkey = chosen_hotkey(hwnd);
-    if lookup {
-        if hotkey.is_none() {
-            return Err("Chọn phím tắt cho Tra cứu nhanh (cần có Ctrl hoặc Alt).");
-        }
-        if account_id.is_empty() {
-            return Err("Nhập Account ID của Cloudflare để dùng Tra cứu nhanh.");
-        }
-        if text(hwnd, ID_LOOKUP_TOKEN).trim().is_empty() && !secret::has_token() {
-            return Err("Nhập API token của Cloudflare để dùng Tra cứu nhanh.");
-        }
     }
 
     let [background, text_color, secondary, accent] = state.colors;
@@ -1024,14 +942,10 @@ fn read(hwnd: HWND) -> Result<Config, &'static str> {
     c.alerts.clipboard = checked(hwnd, ID_ALERT_CLIPBOARD);
     c.alerts.notifications = checked(hwnd, ID_ALERT_NOTIFICATIONS);
     c.alerts.seconds = alert_seconds;
-    c.lookup.enabled = lookup;
-    if let Some(keys) = hotkey {
-        c.lookup.hotkey = keys;
-    }
-    c.lookup.model = chosen_model(hwnd);
-    c.lookup.account_id = account_id;
-    let prompt = text(hwnd, ID_LOOKUP_PROMPT).replace("\r\n", "\n");
-    c.lookup.system_prompt = prompt.trim().to_string();
+    c.ai.model = chosen_model(hwnd);
+    c.ai.account_id = text(hwnd, ID_AI_ACCOUNT).trim().to_string();
+    let prompt = text(hwnd, ID_AI_PROMPT).replace("\r\n", "\n");
+    c.ai.system_prompt = prompt.trim().to_string();
     Ok(c)
 }
 
@@ -1168,19 +1082,8 @@ fn update_enabled(hwnd: HWND) {
     set_text(hwnd, ID_CLEAR_CACHE, &label);
     enable(hwnd, ID_CLEAR_CACHE, lyrics && has_files);
 
-    let lookup = checked(hwnd, ID_LOOKUP);
-    for id in [
-        ID_LOOKUP_HOTKEY,
-        ID_LOOKUP_MODEL,
-        ID_LOOKUP_ACCOUNT,
-        ID_LOOKUP_TOKEN,
-        ID_LOOKUP_PROMPT,
-        ID_LOOKUP_TEST,
-    ] {
-        enable(hwnd, id, lookup);
-    }
     let has_token = secret::has_token();
-    enable(hwnd, ID_LOOKUP_TOKEN_CLEAR, lookup && has_token);
+    enable(hwnd, ID_AI_TOKEN_CLEAR, has_token);
     let banner = HSTRING::from(if has_token {
         "Đã lưu (để trống để giữ nguyên)"
     } else {
@@ -1188,42 +1091,18 @@ fn update_enabled(hwnd: HWND) {
     });
     send(
         hwnd,
-        ID_LOOKUP_TOKEN,
+        ID_AI_TOKEN,
         EM_SETCUEBANNER,
         1,
         banner.as_ptr() as isize,
     );
-    set_text(
-        hwnd,
-        ID_LOOKUP_HOTKEY_STATUS,
-        &hotkey_status_line(hwnd, lookup),
-    );
-}
-
-/// Dòng trạng thái dưới ô phím tắt
-fn hotkey_status_line(hwnd: HWND, enabled: bool) -> String {
-    if !enabled {
-        return String::new();
-    }
-    let saved = config::load().map(|c| c.lookup).unwrap_or_default();
-    let chosen = chosen_hotkey(hwnd);
-    if !saved.enabled || chosen.as_deref() != Some(saved.hotkey.as_str()) {
-        return "Bấm Lưu để dùng phím tắt này.".to_string();
-    }
-    match hotkey::status() {
-        hotkey::Status::Registered => format!("Đang dùng: nhấn {} ở bất cứ đâu.", saved.hotkey),
-        hotkey::Status::Failed => {
-            "⚠ Ứng dụng khác đang dùng phím tắt này, hãy chọn tổ hợp khác.".to_string()
-        }
-        hotkey::Status::Off => "Bấm Lưu để dùng phím tắt này.".to_string(),
-    }
 }
 
 /// Gửi một câu hỏi thử bằng Account ID, token (ô nhập hoặc token đã lưu) và model đang chọn
 fn test_connection(hwnd: HWND) {
-    let typed = text(hwnd, ID_LOOKUP_TOKEN).trim().to_string();
+    let typed = text(hwnd, ID_AI_TOKEN).trim().to_string();
     let settings = ai::Settings {
-        account_id: text(hwnd, ID_LOOKUP_ACCOUNT).trim().to_string(),
+        account_id: text(hwnd, ID_AI_ACCOUNT).trim().to_string(),
         token: if typed.is_empty() {
             secret::load_token().unwrap_or_default()
         } else {
@@ -1232,8 +1111,8 @@ fn test_connection(hwnd: HWND) {
         model: chosen_model(hwnd),
         system_prompt: "Trả lời đúng một câu ngắn.".to_string(),
     };
-    set_text(hwnd, ID_LOOKUP_TEST_RESULT, "Đang hỏi thử AI…");
-    enable(hwnd, ID_LOOKUP_TEST, false);
+    set_text(hwnd, ID_AI_TEST_RESULT, "Đang hỏi thử AI…");
+    enable(hwnd, ID_AI_TEST, false);
     let hwnd_raw = hwnd.0 as isize;
     std::thread::spawn(move || {
         let question = ai::Message::user("Chào bạn! Hãy xác nhận bạn đang hoạt động.");
@@ -1245,7 +1124,7 @@ fn test_connection(hwnd: HWND) {
         unsafe {
             let _ = PostMessageW(
                 Some(HWND(hwnd_raw as *mut c_void)),
-                WM_LOOKUP_TEST_DONE,
+                WM_AI_TEST_DONE,
                 WPARAM(0),
                 LPARAM(0),
             );
@@ -1275,9 +1154,8 @@ fn save(hwnd: HWND) {
     if autostart != autostart::is_enabled() {
         autostart::set(autostart);
     }
-    // Token không nằm trong file cấu hình: cất vào Credential Manager (để trống = giữ cũ).
-    // Island đọc token mỗi lần hỏi, nên đổi token không cần khởi động lại
-    let token = text(hwnd, ID_LOOKUP_TOKEN).trim().to_string();
+    // Token không nằm trong file cấu hình: cất vào Credential Manager (để trống = giữ cũ)
+    let token = text(hwnd, ID_AI_TOKEN).trim().to_string();
     if !token.is_empty()
         && let Err(e) = secret::save_token(&token)
     {
@@ -1310,14 +1188,12 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
             lyrics::clear_cache();
             update_enabled(hwnd);
         }
-        ID_LOOKUP_TOKEN_CLEAR => {
+        ID_AI_TOKEN_CLEAR => {
             secret::delete_token();
-            set_text(hwnd, ID_LOOKUP_TOKEN, "");
+            set_text(hwnd, ID_AI_TOKEN, "");
             update_enabled(hwnd);
         }
-        ID_LOOKUP_TEST => test_connection(hwnd),
-        // Đổi phím tắt: cập nhật dòng trạng thái ("Bấm Lưu để dùng…")
-        ID_LOOKUP_HOTKEY if code == EN_CHANGE => update_enabled(hwnd),
+        ID_AI_TEST => test_connection(hwnd),
         id if (ID_COLOR..ID_COLOR + 4).contains(&id) => pick_color(hwnd, (id - ID_COLOR) as usize),
         ID_BACKDROP if code == CBN_SELCHANGE => {
             // Nền đục hẳn thì không thấy lớp kính: tự giảm độ đục cho người dùng
@@ -1345,11 +1221,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         }
         WM_HSCROLL => update_values(hwnd),
         WM_TIMER if wparam.0 == TIMER_NOW_PLAYING => refresh_offset(hwnd),
-        WM_LOOKUP_TEST_DONE => {
+        WM_AI_TEST_DONE => {
             if let Some(line) = TEST_RESULT.lock().unwrap().take() {
-                set_text(hwnd, ID_LOOKUP_TEST_RESULT, &line);
+                set_text(hwnd, ID_AI_TEST_RESULT, &line);
             }
-            enable(hwnd, ID_LOOKUP_TEST, checked(hwnd, ID_LOOKUP));
+            enable(hwnd, ID_AI_TEST, true);
         }
         WM_DRAWITEM => {
             draw_swatch(unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) });

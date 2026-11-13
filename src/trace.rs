@@ -1,5 +1,5 @@
-//! Nhật ký gỡ lỗi, chỉ có trong bản debug (`cargo run`): ghi từng bước của phím tắt,
-//! focus, ẩn/hiện, và cả thông báo lỗi khi app crash, vào
+//! Nhật ký gỡ lỗi, chỉ có trong bản debug (`cargo run`): ghi lúc island ẩn/hiện vì app
+//! toàn màn hình, lúc thu thành notch, và cả thông báo lỗi khi app crash, vào
 //! `%APPDATA%\DynamicIsland\debug.log`. Bản release không ghi gì.
 
 use std::fmt::Display;
@@ -48,20 +48,4 @@ pub fn start() {
         log(format!("CRASH: {info}"));
         default_hook(info);
     }));
-}
-
-/// Tên tiến trình đang sở hữu cửa sổ trước nhất (để biết focus đang ở đâu)
-pub fn foreground() -> String {
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        let own = pid == windows::Win32::System::Threading::GetCurrentProcessId();
-        format!(
-            "{:?} (pid {pid}{})",
-            hwnd.0,
-            if own { ", chính island" } else { "" }
-        )
-    }
 }

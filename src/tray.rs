@@ -11,7 +11,7 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::{HSTRING, PCWSTR, Result, w},
+    core::{PCWSTR, Result, w},
 };
 
 /// Thông điệp Windows gửi về cửa sổ khi có sự kiện chuột trên icon khay
@@ -21,15 +21,12 @@ const TRAY_ID: u32 = 1;
 const ID_SETTINGS: usize = 1;
 const ID_EXIT: usize = 2;
 const ID_LYRICS_COLLAPSED: usize = 3;
-const ID_LOOKUP: usize = 4;
 
 /// Mục menu cần tới trạng thái của app; main.rs làm tiếp
 pub enum Action {
     OpenSettings,
     /// Bật/tắt lời bài hát trên island thu gọn (giá trị mới)
     SetLyricsCollapsed(bool),
-    /// Mở hộp Tra cứu nhanh (cách mở thứ hai, khi phím tắt bị app khác chặn)
-    OpenLookup,
 }
 
 pub fn add(hwnd: HWND) -> Result<()> {
@@ -64,21 +61,10 @@ pub fn remove(hwnd: HWND) {
 }
 
 /// Hiện menu chuột phải và xử lý mục được chọn.
-/// `lyrics_collapsed`: tùy chọn lời trên island thu gọn (None = đã tắt lời bài hát).
-/// `lookup_hotkey`: phím tắt của Tra cứu nhanh (None = đang tắt, không có mục này)
-pub fn show_menu(
-    hwnd: HWND,
-    lyrics_collapsed: Option<bool>,
-    lookup_hotkey: Option<&str>,
-) -> Option<Action> {
+/// `lyrics_collapsed`: tùy chọn lời trên island thu gọn (None = đã tắt lời bài hát)
+pub fn show_menu(hwnd: HWND, lyrics_collapsed: Option<bool>) -> Option<Action> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
-
-        if let Some(keys) = lookup_hotkey {
-            // Chữ sau dấu tab hiện căn phải, như phím tắt trong menu của Windows
-            let label = HSTRING::from(format!("Tra cứu nhanh với AI\t{keys}"));
-            let _ = AppendMenuW(menu, MF_STRING, ID_LOOKUP, &label);
-        }
 
         let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Cài đặt…"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -119,7 +105,6 @@ pub fn show_menu(
                 return Some(Action::SetLyricsCollapsed(on));
             }
             ID_SETTINGS => return Some(Action::OpenSettings),
-            ID_LOOKUP => return Some(Action::OpenLookup),
             ID_EXIT => {
                 let _ = DestroyWindow(hwnd);
             }

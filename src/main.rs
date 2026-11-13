@@ -1,7 +1,7 @@
 // Bản release chạy như ứng dụng cửa sổ (không có cửa sổ console đen)
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod ai; // trợ lý AI (Cloudflare Workers AI) cho Tra cứu nhanh
+mod ai; // gọi trợ lý AI (Cloudflare Workers AI)
 mod alerts; // thông báo tạm thời: vừa sao chép, thông báo Windows
 mod animation; // lò xo cho hiệu ứng co giãn
 mod app; // trạng thái island, xử lý sự kiện
@@ -12,17 +12,15 @@ mod clipboard; // nội dung vừa sao chép
 mod config; // đọc file cấu hình config.toml
 mod content; // nội dung hiển thị và các trang (Idle, Media, Media Player)
 mod graphics; // vẽ bằng Direct2D + DirectComposition
-mod hotkey; // phím tắt toàn cục mở Tra cứu nhanh
 mod http; // HTTP bằng WinHTTP (thời tiết, lời bài hát, AI)
 mod icon; // biểu tượng ứng dụng 64px và tên ứng dụng
 mod layout; // kích thước, vị trí nút
-mod lookup; // Tra cứu nhanh: hộp hỏi AI trên island
 mod lyrics; // lời bài hát chạy theo nhạc (LRCLIB + cache trên đĩa)
 mod media; // luồng nền đọc/điều khiển media
 mod meter; // mức âm thanh đang phát, cho sóng nhạc của trang Media Player
 mod notifications; // thông báo Windows mới nhất
 mod palette; // màu nhấn lấy từ ảnh bìa
-mod secret; // cất API token trong Windows Credential Manager
+mod secret; // cất API token của AI trong Windows Credential Manager
 mod settings; // cửa sổ Cài đặt
 mod trace; // nhật ký gỡ lỗi (chỉ bản debug)
 mod tray; // icon khay hệ thống
@@ -39,7 +37,6 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
-            Input::KeyboardAndMouse::SetFocus,
             Shell::{QUNS_PRESENTATION_MODE, SHQueryUserNotificationState},
             WindowsAndMessaging::*,
         },
@@ -58,8 +55,6 @@ use tray::WM_TRAY;
 use weather::WM_WEATHER_CHANGED;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
-/// Island vừa mất focus (hẹn từ WM_ACTIVATE, xem wnd_proc)
-const WM_FOCUS_LOST: u32 = WM_APP + 7;
 
 thread_local! {
     // wnd_proc là hàm `extern "system"` nên không nhận được tham số riêng;
@@ -67,21 +62,18 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-/// Chạy `f` với app nếu nó đã được tạo
-fn with_app(f: impl FnOnce(&mut App)) {
-    with_app_or((), f);
-}
-
-/// Như `with_app` nhưng trả về kết quả của `f` (`default` nếu không chạy được).
+/// Chạy `f` với app nếu nó đã được tạo.
 ///
-/// Một số hàm Windows (ShowWindow, SetForegroundWindow...) gửi ngay thông điệp về chính
-/// cửa sổ này trong lúc app còn đang được dùng. Khi đó bỏ qua thông điệp gửi lồng đó
-/// thay vì crash vì mượn app hai lần; việc cần làm sau đó thì gửi lại bằng PostMessage
-fn with_app_or<R>(default: R, f: impl FnOnce(&mut App) -> R) -> R {
-    APP.with(|cell| match cell.try_borrow_mut() {
-        Ok(mut app) => app.as_mut().map_or(default, f),
-        Err(_) => default,
-    })
+/// Một số hàm Windows (ShowWindow...) gửi ngay thông điệp về chính cửa sổ này trong lúc app
+/// còn đang được dùng. Khi đó bỏ qua thông điệp gửi lồng đó thay vì crash vì mượn app hai lần
+fn with_app(f: impl FnOnce(&mut App)) {
+    APP.with(|cell| {
+        if let Ok(mut app) = cell.try_borrow_mut()
+            && let Some(app) = app.as_mut()
+        {
+            f(app);
+        }
+    });
 }
 
 /// Đọc một giá trị từ app (None nếu app chưa được tạo).
@@ -93,49 +85,14 @@ fn read_app<R>(f: impl FnOnce(&App) -> R) -> Option<R> {
 /// Hiện menu chuột phải (từ icon khay hoặc từ chính island)
 fn show_menu(hwnd: HWND) {
     let collapsed = read_app(App::lyrics_collapsed).flatten();
-    let hotkey = read_app(|app| app.lookup_hotkey().map(String::from)).flatten();
-    match tray::show_menu(hwnd, collapsed, hotkey.as_deref()) {
+    match tray::show_menu(hwnd, collapsed) {
         Some(tray::Action::OpenSettings) => settings::open(hwnd),
-        Some(tray::Action::OpenLookup) => {
-            trace::log("mở Tra cứu nhanh từ menu");
-            let opened = with_app_or(false, |app| app.open_lookup_now(hwnd));
-            focus_island(hwnd, opened);
-        }
         Some(tray::Action::SetLyricsCollapsed(on)) => {
             with_app(|app| app.set_lyrics_collapsed(hwnd, on));
             // Ghi vào file cấu hình để lần sau mở lên vẫn giữ; lỗi thì chỉ mất lựa chọn này
             let _ = config::save_lyrics_collapsed(on);
         }
         None => {}
-    }
-}
-
-/// Đưa island lên trước để nhận bàn phím, sau khi hộp Tra cứu nhanh vừa mở. Làm sau khi
-/// đã trả app, vì Windows gửi ngay WM_ACTIVATE về cửa sổ. Được phép giành focus vì người
-/// dùng vừa bấm phím tắt / chọn menu của chính app này
-fn focus_island(hwnd: HWND, opened: bool) {
-    if !opened {
-        return;
-    }
-    unsafe {
-        let mut fg = SetForegroundWindow(hwnd).as_bool();
-        if !fg {
-            // Windows không cho giành focus: tạm "gắn" vào luồng của cửa sổ đang ở trước
-            // (cách AutoHotkey, PowerToys làm) rồi thử lại
-            use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-            let other = GetWindowThreadProcessId(GetForegroundWindow(), None);
-            let me = GetCurrentThreadId();
-            if other != 0 && other != me {
-                let _ = AttachThreadInput(me, other, true);
-                fg = SetForegroundWindow(hwnd).as_bool();
-                let _ = AttachThreadInput(me, other, false);
-            }
-        }
-        let _ = SetFocus(Some(hwnd));
-        trace::log(format!(
-            "SetForegroundWindow = {fg}, trước nhất: {}",
-            trace::foreground()
-        ));
     }
 }
 
@@ -211,15 +168,6 @@ fn is_fullscreen_app_running(island: HWND) -> (bool, String) {
             r.left, r.top, r.right, r.bottom, m.left, m.top, m.right, m.bottom
         );
         (covers, reason)
-    }
-}
-
-/// Island hoặc cửa sổ Cài đặt đang ở trước nhất? (người dùng đang dùng chính app này)
-fn own_window_in_front() -> bool {
-    unsafe {
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
-        pid == windows::Win32::System::Threading::GetCurrentProcessId()
     }
 }
 
@@ -356,14 +304,6 @@ fn main() -> Result<()> {
     }
     let app = App::new(graphics, layout, backdrop, &config, tx, clips);
     app.show_first_frame(hwnd)?;
-    // Tra cứu nhanh: phím tắt toàn cục (trùng với app khác thì Cài đặt sẽ báo)
-    match app.lookup_hotkey() {
-        Some(keys) => {
-            let status = hotkey::register(hwnd, keys);
-            trace::log(format!("đăng ký phím tắt {keys}: {status:?}"));
-        }
-        None => trace::log("Tra cứu nhanh đang tắt trong cấu hình"),
-    }
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
     tray::add(hwnd)?;
@@ -388,12 +328,6 @@ fn main() -> Result<()> {
 }
 
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg == WM_HOTKEY {
-        trace::log(format!(
-            "nhận WM_HOTKEY mã {} (lparam {:#x})",
-            wparam.0, lparam.0
-        ));
-    }
     match msg {
         WM_MOUSEMOVE => {
             let (x, y) = mouse_pos(lparam);
@@ -417,13 +351,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         clipboard::WM_CLIPBOARDUPDATE => with_app(|app| app.on_clipboard_update(hwnd)),
         alerts::WM_ALERT => with_app(|app| app.on_alerts(hwnd)),
         WM_TIMER => {
-            // Người dùng đang gõ trong hộp Tra cứu nhanh (island ở trước nhất) thì chắc chắn
-            // không có game/phim toàn màn hình nào đang che, khỏi hỏi Windows
-            let (fullscreen, reason) = if own_window_in_front() {
-                (false, String::new())
-            } else {
-                is_fullscreen_app_running(hwnd)
-            };
+            let (fullscreen, reason) = is_fullscreen_app_running(hwnd);
             if fullscreen != read_app(App::is_hidden).unwrap_or(false) {
                 trace::log(format!("kiểm tra toàn màn hình: {fullscreen}, vì {reason}"));
             }
@@ -432,51 +360,6 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_MEDIA_CHANGED => with_app(|app| app.on_media_changed(hwnd)),
         WM_WEATHER_CHANGED => with_app(|app| app.on_weather_changed(hwnd)),
         WM_LYRICS_CHANGED => with_app(|app| app.on_lyrics_changed(hwnd)),
-        // Tra cứu nhanh: phím tắt, gõ phím, mất focus, AI trả lời xong
-        WM_HOTKEY if wparam.0 as i32 == hotkey::LOOKUP_HOTKEY_ID => {
-            trace::log(format!("WM_HOTKEY, trước nhất: {}", trace::foreground()));
-            let opened = with_app_or(false, |app| app.toggle_lookup(hwnd));
-            trace::log(format!("sau toggle: hộp đang mở = {opened}"));
-            focus_island(hwnd, opened);
-        }
-        WM_KEYDOWN => {
-            let handled = with_app_or(false, |app| app.on_key(hwnd, wparam.0 as u16));
-            if !handled {
-                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-            }
-        }
-        WM_CHAR => with_app(|app| app.on_char(wparam.0 as u16)),
-        // Mất focus (bấm sang cửa sổ khác): đóng hộp Tra cứu nhanh. Thông điệp này thường được
-        // gửi lồng trong lúc app đang bận (ShowWindow, SetForegroundWindow), nên hẹn xử lý sau
-        WM_ACTIVATE => {
-            trace::log(format!(
-                "WM_ACTIVATE {} (wparam {:#x}), trước nhất: {}",
-                if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                    "mất focus"
-                } else {
-                    "được focus"
-                },
-                wparam.0,
-                trace::foreground()
-            ));
-            if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                unsafe {
-                    let _ = PostMessageW(Some(hwnd), WM_FOCUS_LOST, WPARAM(0), LPARAM(0));
-                }
-            }
-            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-        }
-        // Lúc xử lý thì kiểm tra lại: có thể island đã được đưa lên trước lần nữa
-        WM_FOCUS_LOST => {
-            trace::log(format!(
-                "WM_FOCUS_LOST, trước nhất: {}",
-                trace::foreground()
-            ));
-            if unsafe { GetForegroundWindow() } != hwnd {
-                with_app(|app| app.on_focus_lost(hwnd));
-            }
-        }
-        lookup::WM_LOOKUP_DONE => with_app(|app| app.on_lookup_done(hwnd)),
         // Màn hình đổi (cắm/rút, đổi độ phân giải): đặt lại vị trí
         WM_DISPLAYCHANGE => with_app(|app| {
             position_window(hwnd, app.layout());
@@ -493,7 +376,6 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         // Chuột phải lên island: cùng menu với icon khay
         WM_RBUTTONUP => show_menu(hwnd),
         WM_DESTROY => {
-            hotkey::unregister(hwnd);
             tray::remove(hwnd);
             unsafe { PostQuitMessage(0) };
         }

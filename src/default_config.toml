@@ -65,13 +65,10 @@ clipboard = true     # nội dung vừa sao chép (mật khẩu từ trình qu�
 notifications = true # thông báo Windows mới (lần đầu Windows có thể hỏi quyền)
 seconds = 4          # mỗi thông báo hiện bao lâu (2–30 giây); rê chuột vào thì giữ lại
 
-[lookup]
-# Tra cứu nhanh: nhấn phím tắt để mở hộp hỏi AI ngay trên island, Enter để gửi.
-# Dùng Workers AI của Cloudflare: câu hỏi và vài lượt chat gần nhất được gửi tới Cloudflare.
+[ai]
+# Trợ lý AI dùng Workers AI của Cloudflare.
 # API token KHÔNG nằm trong file này: nhập trong cửa sổ Cài đặt, app cất vào
 # Windows Credential Manager (mục "DynamicIsland/CloudflareAIToken").
-enabled = false
-hotkey = "Ctrl+Alt+`"              # ví dụ "Ctrl+Shift+Space", "Alt+F2"
 model = "@cf/openai/gpt-oss-20b"   # hoặc "@cf/openai/gpt-oss-120b" (thông minh hơn, chậm hơn)
 account_id = ""                    # Account ID trong trang Cloudflare (dashboard > Workers AI)
 # Lời dặn cho trợ lý: vai trò, giọng văn, độ dài câu trả lời

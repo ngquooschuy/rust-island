@@ -1,7 +1,7 @@
-//! Trợ lý AI cho Tra cứu nhanh: gọi Workers AI của Cloudflare (model gpt-oss của OpenAI).
+//! Trợ lý AI: gọi Workers AI của Cloudflare (model gpt-oss của OpenAI).
 //!
 //! Người dùng tự cấu hình Account ID (trong config.toml) và API token (cất trong Windows
-//! Credential Manager, xem secret.rs). Câu hỏi và vài lượt chat gần nhất được gửi tới
+//! Credential Manager, xem secret.rs). Các lượt chat được gửi tới
 //! `https://api.cloudflare.com/client/v4/accounts/<ID>/ai/run/<model>`.
 //!
 //! Tài liệu của Cloudflare không mô tả dạng kết quả của gpt-oss, nên `parse_reply` nhận cả
@@ -28,8 +28,6 @@ Không dùng bảng hay định dạng Markdown phức tạp.";
 /// gpt-oss "suy nghĩ" trước khi trả lời và phần đó cũng tính vào giới hạn: mặc định của
 /// Cloudflare (256) dễ làm câu trả lời bị cụt, nên đặt cao hơn
 const MAX_TOKENS: u32 = 2048;
-/// Chỉ gửi kèm chừng này lượt hỏi-đáp gần nhất (đủ để hiểu ngữ cảnh, không tốn token)
-pub const CONTEXT_TURNS: usize = 6;
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct Message {
@@ -45,6 +43,8 @@ impl Message {
         }
     }
 
+    /// Câu AI đã trả lời, để gửi kèm khi chat nhiều lượt (hiện chưa có chỗ nào dùng)
+    #[allow(dead_code)]
     pub fn assistant(text: &str) -> Self {
         Self {
             role: "assistant",
@@ -193,7 +193,7 @@ fn http_error(status: u32, body: &str) -> String {
     }
 }
 
-/// Chỉ bản debug: ISLAND_FAKE_AI=1 thì trả lời giả sau 1,5 giây, để thử giao diện
+/// Chỉ bản debug: ISLAND_FAKE_AI=1 thì trả lời giả sau 1,5 giây, để thử mà không gọi Cloudflare
 /// mà không cần tài khoản Cloudflare
 pub fn fake() -> bool {
     cfg!(debug_assertions) && std::env::var_os("ISLAND_FAKE_AI").is_some()
@@ -226,7 +226,7 @@ pub fn ask(settings: &Settings, chat: &[Message]) -> Result<String, String> {
     parse_reply(&response.body)
 }
 
-/// Bỏ ký hiệu Markdown để hiện chữ thường trên island:
+/// Bỏ ký hiệu Markdown để hiện chữ thường (trong Cài đặt, trên island):
 /// "**đậm**" → "đậm", "# Tiêu đề" → "Tiêu đề", "- ý" / "* ý" → "• ý", bỏ dòng ```
 pub fn plain_text(markdown: &str) -> String {
     let mut lines = Vec::new();

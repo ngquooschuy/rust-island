@@ -25,10 +25,9 @@ use crate::config::{BackdropKind, Color, Config};
 use crate::content::{self, Content, LyricsView, Page, Progress};
 use crate::icon::Icon;
 use crate::layout::{
-    Expanded, LOOKUP_ROWS_MAX, LYRICS_BUTTON, Layout, PLAYER_COVER, PLAYER_COVER_TOP, PLAYER_PAD,
-    WEATHER_CARD_GAP, WEATHER_CARD_H, WEATHER_CARDS_TOP,
+    Expanded, LYRICS_BUTTON, Layout, PLAYER_COVER, PLAYER_COVER_TOP, PLAYER_PAD, WEATHER_CARD_GAP,
+    WEATHER_CARD_H, WEATHER_CARDS_TOP,
 };
-use crate::lookup;
 use crate::meter::{WAVE_BARS, Wave};
 use crate::palette;
 use crate::weather::{self, Sky, Weather};
@@ -66,26 +65,7 @@ pub struct Frame<'a> {
     pub compact_lyric: Option<CompactLyric<'a>>,
     /// Thông báo tạm thời đang hiện (hoặc đang mờ đi)
     pub alert: Option<AlertView<'a>>,
-    /// Hộp Tra cứu nhanh đang mở (thay cho nội dung trang)
-    pub lookup: Option<LookupView<'a>>,
 }
-
-/// Hộp Tra cứu nhanh cần vẽ
-pub struct LookupView<'a> {
-    pub session: &'a lookup::Session,
-    pub suggestions: &'a [lookup::Suggestion],
-    /// Con trỏ nhấp nháy: đang ở nhịp hiện
-    pub caret_on: bool,
-    /// Đã nhập Account ID và token chưa
-    pub configured: bool,
-    /// Chuột đang ở dòng gợi ý nào, có trên nút "Mới" không
-    pub hover_row: Option<usize>,
-    pub hover_new: bool,
-}
-
-/// Khung chat: khoảng cách giữa câu hỏi và câu trả lời, giữa hai lượt hỏi
-const CHAT_ANSWER_GAP: f32 = 4.0;
-const CHAT_TURN_GAP: f32 = 14.0;
 
 /// Thông báo tạm thời cần vẽ
 pub struct AlertView<'a> {
@@ -181,12 +161,6 @@ pub struct Graphics {
     fmt_alert_body: IDWriteTextFormat,
     /// Biểu tượng dạng chữ của Windows (Segoe MDL2 Assets) khi app không có biểu tượng
     fmt_symbol: IDWriteTextFormat,
-    /// Biểu tượng nhỏ trong hộp Tra cứu nhanh
-    fmt_symbol_small: IDWriteTextFormat,
-    /// Ô nhập, câu hỏi, câu trả lời của Tra cứu nhanh
-    fmt_input: IDWriteTextFormat,
-    fmt_chat_q: IDWriteTextFormat,
-    fmt_chat_a: IDWriteTextFormat,
     layout: Layout,
     background: Color,
     text: Color,
@@ -274,16 +248,6 @@ fn create_bitmap(
 }
 
 /// Định dạng chữ căn trái (các định dạng khác căn giữa)
-/// Chữ căn trái, căn trên, tự xuống dòng (khung chat của Tra cứu nhanh)
-fn wrapping(format: IDWriteTextFormat) -> Result<IDWriteTextFormat> {
-    unsafe {
-        format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
-        format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
-        format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
-    }
-    Ok(format)
-}
-
 fn left_aligned(format: IDWriteTextFormat) -> Result<IDWriteTextFormat> {
     unsafe { format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)? };
     Ok(format)
@@ -450,30 +414,6 @@ impl Graphics {
                 20.0,
                 DWRITE_FONT_WEIGHT_NORMAL,
             )?;
-            let fmt_symbol_small = make_format(
-                &dwrite,
-                h!("Segoe MDL2 Assets"),
-                14.0,
-                DWRITE_FONT_WEIGHT_NORMAL,
-            )?;
-            let fmt_input = left_aligned(make_format(
-                &dwrite,
-                &family,
-                15.0,
-                DWRITE_FONT_WEIGHT_NORMAL,
-            )?)?;
-            let fmt_chat_q = wrapping(make_format(
-                &dwrite,
-                &family,
-                14.5,
-                DWRITE_FONT_WEIGHT_SEMI_BOLD,
-            )?)?;
-            let fmt_chat_a = wrapping(make_format(
-                &dwrite,
-                &family,
-                13.5,
-                DWRITE_FONT_WEIGHT_NORMAL,
-            )?)?;
 
             let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
             let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, true)?;
@@ -502,10 +442,6 @@ impl Graphics {
                 fmt_alert_title,
                 fmt_alert_body,
                 fmt_symbol,
-                fmt_symbol_small,
-                fmt_input,
-                fmt_chat_q,
-                fmt_chat_a,
                 layout,
                 background: config.colors.background,
                 text: config.colors.text,
@@ -728,9 +664,7 @@ impl Graphics {
                 Page::Media | Page::Player => self.draw_media_compact(frame, left, alpha_small),
             }
         }
-        if let Some(view) = frame.lookup.as_ref().filter(|_| alpha_big > 0.0) {
-            self.draw_lookup(view, alpha_big);
-        } else if alpha_big > 0.0 {
+        if alpha_big > 0.0 {
             match page {
                 Page::Idle => self.draw_idle_full(content, alpha_big),
                 Page::Weather => self.draw_weather_full(content, alpha_big),
@@ -742,8 +676,7 @@ impl Graphics {
             self.draw_alert(view);
         }
         unsafe { self.d2d_context.PopAxisAlignedClip() };
-        // Hộp Tra cứu nhanh không thuộc trang nào: không vẽ chấm phân trang
-        if reveal > 0.0 && frame.lookup.is_none() {
+        if reveal > 0.0 {
             self.draw_dots(page, w, h, reveal);
         }
     }
@@ -1176,258 +1109,6 @@ impl Graphics {
             &self.fmt_date,
             rect(el, 66.0, right, 92.0),
         );
-    }
-
-    // ---------- Tra cứu nhanh ----------
-
-    /// Đoạn chữ tự xuống dòng trong bề rộng `width`: (bố cục để vẽ, chiều cao)
-    fn wrapped(
-        &self,
-        text: &str,
-        format: &IDWriteTextFormat,
-        width: f32,
-    ) -> Option<(IDWriteTextLayout, f32)> {
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        unsafe {
-            let layout = self
-                .dwrite
-                .CreateTextLayout(&wide, format, width.max(1.0), 100_000.0)
-                .ok()?;
-            let mut m = DWRITE_TEXT_METRICS::default();
-            layout.GetMetrics(&mut m).ok()?;
-            Some((layout, m.height))
-        }
-    }
-
-    /// Các khối chữ của cuộc trò chuyện, từ trên xuống: (bố cục, chiều cao, màu, độ đậm,
-    /// khoảng cách phía trên)
-    fn chat_blocks(
-        &self,
-        session: &lookup::Session,
-        width: f32,
-    ) -> Vec<(IDWriteTextLayout, f32, Color, f32, f32)> {
-        let mut blocks = Vec::new();
-        for (i, turn) in session.turns.iter().enumerate() {
-            let gap = if i == 0 { 0.0 } else { CHAT_TURN_GAP };
-            if let Some((l, h)) = self.wrapped(&turn.question, &self.fmt_chat_q, width) {
-                blocks.push((l, h, self.text, 1.0, gap));
-            }
-            let (text, color, opacity) = match &turn.answer {
-                lookup::Answer::Pending => {
-                    // Ba chấm chạy lần lượt cho biết đang chờ
-                    let dots = (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_millis())
-                        / 400
-                        % 4) as usize;
-                    (
-                        format!("Đang trả lời{}", ".".repeat(dots)),
-                        self.secondary,
-                        1.0,
-                    )
-                }
-                lookup::Answer::Text(text) => (text.clone(), self.text, 0.86),
-                lookup::Answer::Error(e) => (format!("⚠ {e}"), LOW_RED, 1.0),
-            };
-            if let Some((l, h)) = self.wrapped(&text, &self.fmt_chat_a, width) {
-                blocks.push((l, h, color, opacity, CHAT_ANSWER_GAP));
-            }
-        }
-        blocks
-    }
-
-    /// Tổng chiều cao cuộc trò chuyện (để app biết cuộn lên được bao xa)
-    pub fn chat_height(&self, session: &lookup::Session) -> f32 {
-        let body = self.layout.lookup_body();
-        self.chat_blocks(session, body.right - body.left)
-            .iter()
-            .map(|b| b.1 + b.4)
-            .sum()
-    }
-
-    /// Hộp Tra cứu nhanh:
-    ///   ( 🔍 Hỏi AI…                      [Mới] )
-    ///   Câu hỏi
-    ///   Câu trả lời, tự xuống dòng, cuộn được
-    /// Chưa hỏi gì thì dưới ô nhập là các dòng gợi ý: nội dung clipboard và lịch sử tìm kiếm
-    fn draw_lookup(&self, view: &LookupView, alpha: f32) {
-        let session = view.session;
-        let input = self.layout.lookup_input();
-        let has_chat = !session.turns.is_empty();
-
-        // Ô nhập
-        self.set_brush(self.text, alpha * 0.08);
-        self.fill(rounded(input, 12.0));
-        self.set_brush(self.secondary, alpha);
-        self.draw_text(
-            "\u{E721}", // kính lúp
-            &self.fmt_symbol_small,
-            rect(input.left + 8.0, input.top, input.left + 34.0, input.bottom),
-        );
-        let x0 = input.left + 38.0;
-        let x1 = if has_chat {
-            self.layout.lookup_new_button().left - 8.0
-        } else {
-            input.right - 12.0
-        };
-        let text = session.editor.text();
-        let caret_x = self.text_width(&session.editor.before_caret(), &self.fmt_input);
-        // Chữ dài hơn ô thì trượt sang trái cho con trỏ luôn nằm trong ô
-        let offset = (caret_x - (x1 - x0) + 2.0).max(0.0);
-        unsafe {
-            self.d2d_context.PushAxisAlignedClip(
-                &rect(x0 - 1.0, input.top, x1, input.bottom),
-                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-            );
-        }
-        if text.is_empty() {
-            self.set_brush(self.secondary, alpha * 0.8);
-            let hint = if view.configured {
-                "Hỏi AI bất cứ điều gì…"
-            } else {
-                "Chưa cấu hình AI"
-            };
-            self.draw_text(hint, &self.fmt_input, rect(x0, input.top, x1, input.bottom));
-        } else {
-            let full_w = self.text_width(&text, &self.fmt_input);
-            self.set_brush(self.text, alpha);
-            self.draw_text(
-                &text,
-                &self.fmt_input,
-                rect(
-                    x0 - offset,
-                    input.top,
-                    x0 - offset + full_w + 40.0,
-                    input.bottom,
-                ),
-            );
-        }
-        if view.caret_on {
-            let x = x0 - offset + caret_x;
-            let cy = (input.top + input.bottom) / 2.0;
-            self.set_brush(self.accent, alpha);
-            self.fill(rounded(rect(x, cy - 10.0, x + 1.6, cy + 10.0), 0.8));
-        }
-        unsafe { self.d2d_context.PopAxisAlignedClip() };
-
-        if has_chat {
-            let b = self.layout.lookup_new_button();
-            let hover = if view.hover_new { 0.08 } else { 0.0 };
-            self.set_brush(self.text, alpha * (0.1 + hover));
-            self.fill(rounded(b, 8.0));
-            let label_w = self.text_width("Mới", &self.fmt_alert_app);
-            let lx = (b.left + b.right - label_w) / 2.0;
-            self.set_brush(self.text, alpha);
-            self.draw_text(
-                "Mới",
-                &self.fmt_alert_app,
-                rect(lx, b.top, b.right, b.bottom),
-            );
-            self.draw_chat(session, alpha);
-        } else {
-            self.draw_suggestions(view, alpha);
-        }
-    }
-
-    /// Cuộc trò chuyện, dính đáy (câu mới nhất ở dưới cùng), cuộn lên để xem câu cũ
-    fn draw_chat(&self, session: &lookup::Session, alpha: f32) {
-        let body = self.layout.lookup_body();
-        let width = body.right - body.left;
-        let blocks = self.chat_blocks(session, width);
-        let total: f32 = blocks.iter().map(|b| b.1 + b.4).sum();
-        let visible = body.bottom - body.top;
-        let max_scroll = (total - visible).max(0.0);
-        let scroll = session.scroll.clamp(0.0, max_scroll);
-        // Ngắn hơn khung thì bắt đầu từ trên; dài hơn thì đáy chữ chạm đáy khung
-        let mut y = if total <= visible {
-            body.top
-        } else {
-            body.bottom - total + scroll
-        };
-        unsafe {
-            self.d2d_context
-                .PushAxisAlignedClip(&body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        }
-        for (layout, h, color, opacity, gap) in &blocks {
-            y += gap;
-            if y + h >= body.top && y <= body.bottom {
-                self.set_brush(*color, alpha * opacity);
-                unsafe {
-                    self.d2d_context.DrawTextLayout(
-                        Vector2 { X: body.left, Y: y },
-                        layout,
-                        &self.brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                }
-            }
-            y += h;
-        }
-        unsafe { self.d2d_context.PopAxisAlignedClip() };
-        // Còn chữ phía trên: mờ dần ở mép trên để biết cuộn lên được
-        if scroll < max_scroll {
-            let fade = rect(body.left, body.top - 2.0, body.right, body.top + 14.0);
-            let stops = [(0.0, self.background, 1.0), (1.0, self.background, 0.0)];
-            if let Some(brush) = self.gradient(&stops, (0.0, fade.top), (0.0, fade.bottom)) {
-                unsafe {
-                    brush.SetOpacity(alpha);
-                    self.d2d_context.FillRectangle(&fade, &brush);
-                }
-            }
-        }
-    }
-
-    /// Dòng gợi ý: nội dung clipboard (nếu là chữ) rồi tới các câu đã hỏi gần đây
-    fn draw_suggestions(&self, view: &LookupView, alpha: f32) {
-        let body = self.layout.lookup_body();
-        if !view.configured {
-            let msg = "Mở Cài đặt > Modules, nhập Account ID và API token của Cloudflare \
-                       để bắt đầu hỏi AI.";
-            if let Some((layout, _)) = self.wrapped(msg, &self.fmt_chat_a, body.right - body.left) {
-                self.set_brush(self.secondary, alpha);
-                unsafe {
-                    self.d2d_context.DrawTextLayout(
-                        Vector2 {
-                            X: body.left,
-                            Y: body.top + 4.0,
-                        },
-                        &layout,
-                        &self.brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                }
-            }
-            return;
-        }
-        if view.suggestions.is_empty() {
-            self.set_brush(self.secondary, alpha * 0.8);
-            self.draw_text(
-                "Gõ câu hỏi rồi nhấn Enter  ·  Esc để đóng",
-                &self.fmt_alert_app,
-                rect(body.left + 4.0, body.top, body.right, body.top + 28.0),
-            );
-            return;
-        }
-        for (i, s) in view.suggestions.iter().take(LOOKUP_ROWS_MAX).enumerate() {
-            let r = self.layout.lookup_row(i);
-            let hover = if view.hover_row == Some(i) { 0.07 } else { 0.0 };
-            self.set_brush(self.text, alpha * (0.045 + hover));
-            self.fill(rounded(r, 8.0));
-            let icon = match s.kind {
-                lookup::SuggestionKind::Clipboard => "\u{E77F}", // dán
-                lookup::SuggestionKind::History => "\u{E81C}",   // lịch sử
-            };
-            self.set_brush(self.secondary, alpha);
-            self.draw_text(
-                icon,
-                &self.fmt_symbol_small,
-                rect(r.left + 4.0, r.top, r.left + 30.0, r.bottom),
-            );
-            let x = r.left + 34.0;
-            let (label, f) = self.fit_text(&s.text, &[&self.fmt_alert_body], r.right - 10.0 - x);
-            self.set_brush(self.text, alpha * 0.9);
-            self.draw_text(&label, f, rect(x, r.top, r.right - 10.0, r.bottom));
-        }
     }
 
     // ---------- Trang Thời tiết ----------
