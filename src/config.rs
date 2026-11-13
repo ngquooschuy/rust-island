@@ -196,6 +196,8 @@ pub struct AiConfig {
     pub account_id: String,
     /// Lời dặn cho trợ lý (vai trò, cách trả lời)
     pub system_prompt: String,
+    /// Không tìm được lời bài hát theo tên đang phát thì nhờ AI đoán tên bài thật
+    pub guess_song_names: bool,
 }
 
 impl AiConfig {
@@ -226,6 +228,7 @@ impl Default for AiConfig {
             model: crate::ai::MODELS[0].0.to_string(),
             account_id: String::new(),
             system_prompt: crate::ai::DEFAULT_SYSTEM_PROMPT.to_string(),
+            guess_song_names: true,
         }
     }
 }
@@ -565,6 +568,11 @@ impl Config {
             ("ai", "model", quoted(&self.ai.model)),
             ("ai", "account_id", quoted(&self.ai.account_id)),
             ("ai", "system_prompt", quoted(&self.ai.system_prompt)),
+            (
+                "ai",
+                "guess_song_names",
+                self.ai.guess_song_names.to_string(),
+            ),
         ]
     }
 }

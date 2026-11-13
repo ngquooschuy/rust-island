@@ -71,5 +71,8 @@ seconds = 4          # mỗi thông báo hiện bao lâu (2–30 giây); rê chu
 # Windows Credential Manager (mục "DynamicIsland/CloudflareAIToken").
 model = "@cf/openai/gpt-oss-20b"   # hoặc "@cf/openai/gpt-oss-120b" (thông minh hơn, chậm hơn)
 account_id = ""                    # Account ID trong trang Cloudflare (dashboard > Workers AI)
+# Không tìm được lời bài hát (tên video YouTube lộn xộn, kênh vietsub...) thì gửi tên đang
+# phát cho AI đoán tên bài và ca sĩ thật rồi tìm lại. Mỗi bài chỉ hỏi một lần
+guess_song_names = true
 # Lời dặn cho trợ lý: vai trò, giọng văn, độ dài câu trả lời
 system_prompt = "Bạn là trợ lý thân thiện trên Dynamic Island của Windows. Trả lời ngắn gọn, rõ ràng, bằng ngôn ngữ người dùng đang dùng (mặc định tiếng Việt). Khi được hỏi một từ hoặc cụm từ, giải thích nghĩa trong 2–4 câu, có ví dụ nếu cần. Không dùng bảng hay định dạng Markdown phức tạp."

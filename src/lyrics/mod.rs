@@ -1,12 +1,14 @@
 //! Lời bài hát chạy theo nhạc (live lyrics).
 //!
 //! Luồng media báo bài mới qua [`Requester::request`] → luồng lời bài hát tìm trong cache,
-//! không có thì hỏi LRCLIB → ghi kết quả vào biến dùng chung → báo cửa sổ bằng
-//! `WM_LYRICS_CHANGED`. Giao diện đọc kết quả bằng [`status_for`].
+//! không có thì hỏi LRCLIB (không ra lời đồng bộ thì nhờ AI đoán tên bài thật rồi tìm lại)
+//! → ghi kết quả vào biến dùng chung → báo cửa sổ bằng `WM_LYRICS_CHANGED`.
+//! Giao diện đọc kết quả bằng [`status_for`].
 //!
 //! Một module có thư mục riêng: `lyrics/mod.rs` là cửa chính, các file con
-//! (`lrc`, `lrclib`, `cache`) là chi tiết bên trong, bên ngoài không cần biết.
+//! (`lrc`, `lrclib`, `cache`, `ai_names`) là chi tiết bên trong, bên ngoài không cần biết.
 
+mod ai_names;
 mod cache;
 mod lrc;
 mod lrclib;
@@ -20,6 +22,7 @@ use windows::Win32::{
 };
 
 use crate::http::Session;
+use ai_names::Guesser;
 use cache::Cache;
 use lrc::Lyrics;
 #[cfg(test)]
@@ -134,12 +137,14 @@ impl Requester {
     }
 }
 
-/// Bật tính năng: chuẩn bị cache (`cache_mb = 0` là tắt) và chạy luồng nền
-pub fn start(hwnd_raw: isize, cache_mb: u32) -> Requester {
+/// Bật tính năng: chuẩn bị cache (`cache_mb = 0` là tắt) và chạy luồng nền.
+/// `ai`: (Account ID, model) để nhờ AI đoán tên bài khi không tìm được lời; None = không dùng
+pub fn start(hwnd_raw: isize, cache_mb: u32, ai: Option<(&str, &str)>) -> Requester {
     let dir = crate::config::path().and_then(|p| Some(p.parent()?.join("lyrics")));
     let _ = CACHE.set(dir.and_then(|d| Cache::new(d, cache_mb)));
+    let guesser = ai.and_then(|(account_id, model)| Guesser::new(account_id, model));
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || run(hwnd_raw, rx));
+    std::thread::spawn(move || run(hwnd_raw, rx, guesser));
     Requester { tx }
 }
 
@@ -149,11 +154,12 @@ pub fn cache_summary() -> Option<(usize, String)> {
     Some((count, cache::describe(count, bytes)))
 }
 
-/// Xóa cache trên đĩa (lời đang hiện trên màn hình vẫn giữ)
+/// Xóa cache trên đĩa (lời đang hiện trên màn hình vẫn giữ), kể cả tên bài AI đã đoán
 pub fn clear_cache() {
     if let Some(c) = cache() {
         c.clear();
     }
+    ai_names::forget_all();
 }
 
 /// Chỉ dùng trong test thăm dò: tra LRCLIB trực tiếp, bỏ qua cache
@@ -172,8 +178,34 @@ fn status_from(synced: Option<&str>, plain: Option<&str>) -> Status {
     }
 }
 
-/// Tìm lời cho một bài: cache còn mới → dùng luôn; không thì hỏi LRCLIB
-fn lookup(session: Option<&Session>, t: &Track) -> (Status, Timing) {
+/// LRCLIB không có lời đồng bộ cho tên đang phát: nhờ AI đoán tên bài và ca sĩ thật rồi tìm
+/// lại. Chỉ thay kết quả cũ khi tìm được lời đồng bộ, hoặc trước đó chẳng có lời nào
+fn retry_with_ai(session: &Session, guesser: &Guesser, t: &Track, found: Lookup) -> Lookup {
+    if found.is_synced() || found == Lookup::Instrumental {
+        return found;
+    }
+    let names = match guesser.names_for(t) {
+        Ok(Some(names)) => names,
+        Ok(None) => return found,
+        Err(e) => {
+            crate::trace::log(format!("AI đoán tên bài lỗi: {e}"));
+            return found;
+        }
+    };
+    crate::trace::log(format!(
+        "AI đoán «{}» / «{}» là «{}» của «{}»",
+        t.title, t.artist, names.title, names.artist
+    ));
+    match lrclib::fetch_named(session, t, &names.title, &names.artist) {
+        Ok(better @ Lookup::Lyrics { .. }) if better.is_synced() || found == Lookup::NotFound => {
+            better
+        }
+        _ => found,
+    }
+}
+
+/// Tìm lời cho một bài: cache còn mới → dùng luôn; không thì hỏi LRCLIB (và AI nếu cần)
+fn lookup(session: Option<&Session>, guesser: Option<&Guesser>, t: &Track) -> (Status, Timing) {
     let cached = cache().and_then(|c| c.load(t));
     if let Some((entry, true)) = &cached {
         let status = status_from(entry.synced.as_deref(), entry.plain.as_deref());
@@ -183,7 +215,13 @@ fn lookup(session: Option<&Session>, t: &Track) -> (Status, Timing) {
     let old_offset = cached.as_ref().map_or(0, |(e, _)| e.offset_ms);
     let fetched = session
         .ok_or_else(|| "không mở được kết nối".to_string())
-        .and_then(|s| lrclib::fetch(s, t));
+        .and_then(|s| {
+            let found = lrclib::fetch(s, t)?;
+            Ok(match guesser {
+                Some(g) => retry_with_ai(s, g, t, found),
+                None => found,
+            })
+        });
     // Bản cũ (quá 90 ngày) dùng làm phương án dự phòng khi tải lại thất bại
     let stale = |otherwise: Status| {
         cached
@@ -217,7 +255,7 @@ fn lookup(session: Option<&Session>, t: &Track) -> (Status, Timing) {
     }
 }
 
-fn run(hwnd_raw: isize, rx: Receiver<Track>) {
+fn run(hwnd_raw: isize, rx: Receiver<Track>, guesser: Option<Guesser>) {
     let session = Session::open().ok();
     let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
 
@@ -226,7 +264,7 @@ fn run(hwnd_raw: isize, rx: Receiver<Track>) {
         while let Ok(newer) = rx.try_recv() {
             track = newer;
         }
-        let (status, timing) = lookup(session.as_ref(), &track);
+        let (status, timing) = lookup(session.as_ref(), guesser.as_ref(), &track);
 
         let mut state = STATE.lock().unwrap();
         // Trong lúc tra, bài có thể đã đổi: chỉ ghi nếu vẫn là bài này
@@ -276,5 +314,83 @@ mod tests {
         assert_eq!(timing_for("Song A", "Someone").offset_ms, MAX_OFFSET_MS);
         set_offset("Song B", "Someone", 5_000, false);
         assert_eq!(timing_for("Song B", "Someone"), Timing::default());
+    }
+
+    /// Thăm dò bằng tài khoản thật: cần Account ID trong config.toml và token trong Credential
+    /// Manager. Câu trả lời AI nhớ vào thư mục tạm, không đụng dữ liệu thật.
+    /// Chạy: cargo test live_ai_guess -- --ignored --nocapture
+    #[test]
+    #[ignore = "gọi Cloudflare Workers AI và LRCLIB thật"]
+    fn live_ai_guess_for_tricky_titles() {
+        let ai = crate::config::load().unwrap().ai;
+        let temp = std::env::temp_dir().join("island_ai_guess_test");
+        let _ = std::fs::create_dir_all(temp.join("DynamicIsland"));
+        // SAFETY: chỉ test này đổi APPDATA, chạy một mình với --ignored
+        unsafe { std::env::set_var("APPDATA", &temp) };
+        println!("model: {}", ai.model);
+        let guesser = Guesser::new(&ai.account_id, &ai.model).expect("chưa nhập Account ID");
+        let session = Session::open().unwrap();
+        let cases = [
+            (
+                "[Vietsub + Lyrics] Shape of You - Ed Sheeran",
+                "Kênh Vietsub Hay",
+                0,
+            ),
+            ("Chúng Ta Của Hiện Tại | Lyrics Video", "Lyrics Việt Nam", 0),
+            (
+                "Hãy Trao Cho Anh (Lyrics) ft. Snoop Dogg",
+                "Nhạc Trẻ Hay Nhất",
+                0,
+            ),
+            (
+                "Nơi Này Có Anh | Lyrics | Nhạc Trẻ Hot",
+                "Kênh Lyrics Hay",
+                0,
+            ),
+            (
+                "Ngày Mai Người Ta Lấy Chồng (Lyrics Video)",
+                "Lofi Chill Việt",
+                0,
+            ),
+            (
+                "See Tình - Hoàng Thùy Linh | Nhạc Hot TikTok 2022",
+                "TikTok Music VN",
+                0,
+            ),
+            (
+                "LẠC TRÔI | OFFICIAL MUSIC VIDEO | SƠN TÙNG M-TP",
+                "Sơn Tùng M-TP Official",
+                0,
+            ),
+        ];
+        for (title, artist, duration_s) in cases {
+            let t = Track {
+                title: title.into(),
+                artist: artist.into(),
+                album: String::new(),
+                duration_s,
+            };
+            let before = lrclib::fetch(&session, &t).unwrap();
+            let names = if before.is_synced() {
+                None
+            } else {
+                Some(guesser.names_for(&t))
+            };
+            let after = retry_with_ai(&session, &guesser, &t, before.clone());
+            let kind = |l: &Lookup| match l {
+                Lookup::Lyrics {
+                    synced: Some(s), ..
+                } => format!("lời đồng bộ: {}", s.lines().nth(4).unwrap_or_default()),
+                Lookup::Lyrics { .. } => "chỉ lời thường".to_string(),
+                Lookup::Instrumental => "không lời".to_string(),
+                Lookup::NotFound => "không thấy".to_string(),
+            };
+            println!(
+                "{title} / {artist}\n  trước: {}\n  AI: {names:?}\n  sau:   {}",
+                kind(&before),
+                kind(&after)
+            );
+        }
+        let _ = std::fs::remove_dir_all(temp);
     }
 }

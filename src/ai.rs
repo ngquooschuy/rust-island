@@ -158,7 +158,7 @@ fn reply_from_result(result: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Câu trả lời trong JSON Cloudflare trả về (HTTP 200), hoặc lỗi dễ hiểu
+/// Câu trả lời trong JSON Cloudflare trả về (HTTP 200), giữ nguyên chữ AI viết, hoặc lỗi dễ hiểu
 pub fn parse_reply(body: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(body).map_err(|_| "AI trả về dữ liệu lạ".to_string())?;
     if v.get("success").and_then(Value::as_bool) == Some(false) {
@@ -166,8 +166,7 @@ pub fn parse_reply(body: &str) -> Result<String, String> {
     }
     let result = v.get("result").unwrap_or(&v);
     let text = reply_from_result(result).ok_or("Không đọc được câu trả lời của AI")?;
-    let text = plain_text(&text);
-    if text.trim().is_empty() {
+    if plain_text(&text).trim().is_empty() {
         Err("AI không trả lời (thử hỏi lại, hoặc chọn model 120B)".to_string())
     } else {
         Ok(text)
@@ -194,25 +193,30 @@ fn http_error(status: u32, body: &str) -> String {
 }
 
 /// Chỉ bản debug: ISLAND_FAKE_AI=1 thì trả lời giả sau 1,5 giây, để thử mà không gọi Cloudflare
-/// mà không cần tài khoản Cloudflare
 pub fn fake() -> bool {
     cfg!(debug_assertions) && std::env::var_os("ISLAND_FAKE_AI").is_some()
 }
 
-/// Gửi câu hỏi (lượt cuối của `chat`) và chờ câu trả lời. Chạy trên luồng nền
+/// Gửi câu hỏi (lượt cuối của `chat`) và chờ câu trả lời, đã bỏ ký hiệu Markdown để hiện
+/// lên màn hình. Chạy trên luồng nền
 pub fn ask(settings: &Settings, chat: &[Message]) -> Result<String, String> {
+    ask_raw(settings, chat).map(|text| plain_text(&text))
+}
+
+/// Như `ask` nhưng giữ nguyên chữ AI viết (để đọc JSON trong câu trả lời)
+pub fn ask_raw(settings: &Settings, chat: &[Message]) -> Result<String, String> {
     if fake() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let question = chat.last().map_or("", |m| m.content.as_str());
-        return Ok(plain_text(&format!(
+        return Ok(format!(
             "Câu trả lời thử cho «{question}».\n\n**Pizza** ngon vì lớp đế nướng giòn, \
              phô mai tan chảy béo ngậy và sốt cà chua chua ngọt hòa quyện với nhau.\n\
              - Nướng ở lò rất nóng nên vỏ giòn mà ruột vẫn mềm\n\
              - Vị umami của cà chua và phô mai làm ta muốn ăn thêm"
-        )));
+        ));
     }
     if settings.account_id.trim().is_empty() || settings.token.trim().is_empty() {
-        return Err("Chưa cấu hình AI: mở Cài đặt > Modules để nhập Account ID và token".into());
+        return Err("Chưa cấu hình AI: mở Cài đặt > Trợ lý AI để nhập Account ID và token".into());
     }
     let session = Session::open().map_err(|e| format!("Không kết nối được: {e}"))?;
     let body = request_body(&settings.system_prompt, chat);
@@ -308,7 +312,12 @@ mod tests {
 
         let chat = r#"{"result":{"choices":[{"index":0,"message":{"role":"assistant",
             "content":"Pizza ngon vì **phô mai**.","reasoning_content":"..."}}]},"success":true}"#;
-        assert_eq!(parse_reply(chat).unwrap(), "Pizza ngon vì phô mai.");
+        // Giữ nguyên chữ AI viết (để đọc JSON); `ask` mới bỏ Markdown khi hiện lên màn hình
+        assert_eq!(parse_reply(chat).unwrap(), "Pizza ngon vì **phô mai**.");
+        assert_eq!(
+            plain_text(&parse_reply(chat).unwrap()),
+            "Pizza ngon vì phô mai."
+        );
 
         let responses = r#"{"result":{"output":[
             {"type":"reasoning","content":[{"type":"reasoning_text","text":"nghĩ..."}]},

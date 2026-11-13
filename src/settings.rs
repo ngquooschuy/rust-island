@@ -62,6 +62,7 @@ const ID_OFFSET_SONG: i32 = 80;
 const ID_OFFSET: i32 = 81;
 const ID_OFFSET_VALUE: i32 = 82;
 const ID_OFFSET_RESET: i32 = 83;
+const ID_AI_GUESS: i32 = 90;
 const ID_AI_MODEL: i32 = 93;
 const ID_AI_ACCOUNT: i32 = 94;
 const ID_AI_TOKEN: i32 = 95;
@@ -735,16 +736,23 @@ fn build(b: &Builder) {
     b.label("API token", 656, 98, 80, -1);
     b.password(740, 96, 192, ID_AI_TOKEN);
     b.button("Xóa token đã lưu", 740, 126, 192, ID_AI_TOKEN_CLEAR, false);
+    b.check(
+        "Nhờ AI đoán tên bài khi không tìm được lời",
+        656,
+        160,
+        280,
+        ID_AI_GUESS,
+    );
     b.label(
         "Lời dặn cho trợ lý (vai trò, cách trả lời)",
         656,
-        164,
+        192,
         276,
         -1,
     );
-    b.multiline(656, 188, 276, 180, ID_AI_PROMPT);
-    b.button("Kiểm tra kết nối", 656, 380, 140, ID_AI_TEST, false);
-    b.note("", 656, 414, 276, 92, ID_AI_TEST_RESULT);
+    b.multiline(656, 216, 276, 156, ID_AI_PROMPT);
+    b.button("Kiểm tra kết nối", 656, 382, 140, ID_AI_TEST, false);
+    b.note("", 656, 416, 276, 104, ID_AI_TEST_RESULT);
     b.note(
         "Câu hỏi được gửi tới Workers AI của Cloudflare. Token cất trong Windows \
          Credential Manager, không ghi vào file cấu hình.",
@@ -864,6 +872,7 @@ fn fill(hwnd: HWND, config: &Config) {
         .unwrap_or_else(|| combo_add(hwnd, ID_AI_MODEL, &assistant.model, usize::MAX));
     combo_select(hwnd, ID_AI_MODEL, model);
     set_text(hwnd, ID_AI_ACCOUNT, &assistant.account_id);
+    set_checked(hwnd, ID_AI_GUESS, assistant.guess_song_names);
     set_text(hwnd, ID_AI_TOKEN, "");
     // Ô nhập nhiều dòng của Windows cần \r\n để xuống dòng
     set_text(
@@ -944,6 +953,7 @@ fn read(hwnd: HWND) -> Result<Config, &'static str> {
     c.alerts.seconds = alert_seconds;
     c.ai.model = chosen_model(hwnd);
     c.ai.account_id = text(hwnd, ID_AI_ACCOUNT).trim().to_string();
+    c.ai.guess_song_names = checked(hwnd, ID_AI_GUESS);
     let prompt = text(hwnd, ID_AI_PROMPT).replace("\r\n", "\n");
     c.ai.system_prompt = prompt.trim().to_string();
     Ok(c)

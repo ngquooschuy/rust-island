@@ -65,7 +65,7 @@ fn non_empty(s: Option<String>) -> Option<String> {
 
 impl Lookup {
     /// Có lời đồng bộ (chạy theo nhạc): kết quả tốt nhất, dừng tìm được
-    fn is_synced(&self) -> bool {
+    pub(super) fn is_synced(&self) -> bool {
         matches!(
             self,
             Lookup::Lyrics {
@@ -333,7 +333,7 @@ fn base_letter(c: char) -> char {
 }
 
 /// Chuỗi để so tên: chữ thường, bỏ dấu, chỉ giữ chữ và số ("Sơn Tùng M-TP" → "sontungmtp")
-fn name_key(s: &str) -> String {
+pub(super) fn name_key(s: &str) -> String {
     s.to_lowercase()
         .chars()
         .filter(|c| c.is_alphanumeric())
@@ -564,6 +564,51 @@ pub fn fetch(session: &Session, t: &Track) -> Result<Lookup, String> {
             t.duration_s,
         );
         if let Some(found) = consider(found) {
+            return Ok(found);
+        }
+    }
+    Ok(fallback)
+}
+
+/// Các câu tìm kiếm cho tên bài và ca sĩ AI đoán được, không trùng nhau
+fn named_queries(title: &str, artist: &str) -> Vec<String> {
+    let mut queries = Vec::new();
+    for q in [format!("{title} {artist}"), title.to_string()] {
+        let q = q.trim().to_string();
+        if !q.is_empty() && !queries.contains(&q) {
+            queries.push(q);
+        }
+    }
+    queries
+}
+
+/// Tìm lại theo tên bài và ca sĩ AI đoán được (xem ai_names.rs). Nhận bản cùng tên bài và
+/// thời lượng gần đúng; không có thì như video MV: cùng tên bài, cùng ca sĩ, không dài hơn
+/// bài đang phát (lời có thể lệch)
+pub fn fetch_named(
+    session: &Session,
+    t: &Track,
+    title: &str,
+    artist: &str,
+) -> Result<Lookup, String> {
+    let titles = WantedTitles::new(&[title]);
+    let mut fallback = Lookup::NotFound;
+    let mut seen: Vec<Record> = Vec::new();
+    for query in named_queries(title, artist) {
+        let body = session.get(&search_url(&query))?.ok()?;
+        let records: Vec<Record> = parse_json(&body)?;
+        let found = pick_best(&records, t.duration_s, &titles);
+        if found.is_synced() {
+            return Ok(found);
+        }
+        if fallback == Lookup::NotFound {
+            fallback = found;
+        }
+        seen.extend(records);
+    }
+    if !name_key(artist).is_empty() {
+        let found = pick_for_video(&seen, &titles, &[artist], t.duration_s);
+        if found.is_synced() || fallback == Lookup::NotFound {
             return Ok(found);
         }
     }
@@ -989,6 +1034,18 @@ mod tests {
             ),
             pair("Em Mới Là Người Yêu Anh", "MIN")
         );
+    }
+
+    #[test]
+    fn named_queries_try_title_with_artist_then_title_alone() {
+        assert_eq!(
+            named_queries("Chúng Ta Của Hiện Tại", "Sơn Tùng M-TP"),
+            [
+                "Chúng Ta Của Hiện Tại Sơn Tùng M-TP",
+                "Chúng Ta Của Hiện Tại"
+            ]
+        );
+        assert_eq!(named_queries("Lạc Trôi", ""), ["Lạc Trôi"]);
     }
 
     #[test]

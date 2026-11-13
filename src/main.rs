@@ -312,10 +312,14 @@ fn main() -> Result<()> {
     }
 
     // Lời bài hát: luồng riêng, luồng media báo cho nó mỗi khi đổi bài
+    let ai = &config.ai;
+    let guess = ai
+        .guess_song_names
+        .then_some((ai.account_id.as_str(), ai.model.as_str()));
     let lyrics = config
         .lyrics
         .enabled
-        .then(|| lyrics::start(hwnd_raw, config.lyrics.cache_mb));
+        .then(|| lyrics::start(hwnd_raw, config.lyrics.cache_mb, guess));
     std::thread::spawn(move || media::run(hwnd_raw, rx, lyrics));
     if config.weather.enabled {
         let weather_config = config.weather.clone();
