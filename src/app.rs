@@ -899,6 +899,12 @@ impl App {
         crate::trace::log("đóng hộp Tra cứu nhanh");
         self.lookup_open = false;
         self.lookup_hover = (None, false);
+        // Đóng là thu thẳng về island thu gọn. Hộp to nên con trỏ thường đang nằm trong nó:
+        // không bỏ trạng thái rê chuột thì island dừng ở trang mở rộng rồi mới thu lại.
+        // Rê chuột lên island lần nữa thì nó mở rộng như thường
+        self.hovered = false;
+        self.keep_tall = false;
+        self.hover_button = None;
         Self::set_activatable(hwnd, false);
         self.retarget(hwnd);
         self.update_fast_timer(hwnd);
