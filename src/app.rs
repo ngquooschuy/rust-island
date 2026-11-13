@@ -18,8 +18,10 @@ use windows::{
                 VK_RIGHT, VK_UP,
             },
             WindowsAndMessaging::{
-                GWL_EXSTYLE, GetCursorPos, GetWindowLongPtrW, KillTimer, SW_HIDE,
-                SW_SHOWNOACTIVATE, SetTimer, SetWindowLongPtrW, ShowWindow, WS_EX_NOACTIVATE,
+                GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
+                GetWindowThreadProcessId, IsWindow, IsWindowVisible, KillTimer, SW_HIDE,
+                SW_SHOWNOACTIVATE, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow,
+                WS_EX_NOACTIVATE,
             },
         },
     },
@@ -156,6 +158,10 @@ pub struct App {
     caret_on: bool,
     /// Chuột đang ở dòng gợi ý nào / trên nút "Mới"
     lookup_hover: (Option<usize>, bool),
+    /// Cửa sổ người dùng đang dùng lúc mở hộp: đóng hộp thì trả focus về đó
+    lookup_return: Option<HWND>,
+    /// Hộp đã được focus lần nào chưa (để biết lúc mất focus mà tự đóng)
+    lookup_focused: bool,
 }
 
 impl App {
@@ -198,6 +204,8 @@ impl App {
             suggestions: Vec::new(),
             caret_on: true,
             lookup_hover: (None, false),
+            lookup_return: None,
+            lookup_focused: false,
             keep_tall: false,
             close_hold: None,
             width: Spring::new(layout.collapsed.0),
@@ -814,8 +822,11 @@ impl App {
     /// Timer nhanh: sóng nhạc nhảy theo âm thanh; lời thì chỉ vẽ lại khi dòng lời đổi
     pub fn on_lyrics_tick(&mut self, hwnd: HWND) {
         if self.lookup_open {
-            self.caret_on = !self.caret_on;
-            self.redraw_if_idle();
+            self.check_lookup_focus(hwnd);
+            if self.lookup_open {
+                self.caret_on = !self.caret_on;
+                self.redraw_if_idle();
+            }
             return;
         }
         if self.wave_live() {
@@ -930,6 +941,10 @@ impl App {
             ai::fake() || (!config.account_id.trim().is_empty() && secret::has_token());
         self.lookup_open = true;
         self.close_hold = None;
+        // Nhớ app đang dùng để đóng hộp thì trả focus về (gõ tiếp được ngay)
+        let front = unsafe { GetForegroundWindow() };
+        self.lookup_return = (!front.is_invalid() && front != hwnd).then_some(front);
+        self.lookup_focused = false;
         self.caret_on = true;
         self.lookup_hover = (None, false);
         self.refresh_suggestions(hwnd);
@@ -969,6 +984,49 @@ impl App {
         self.retarget(hwnd);
         self.update_fast_timer(hwnd);
         self.redraw_if_idle();
+        // Island còn đang giữ focus (đóng bằng phím tắt, Esc): trả focus về app đang dùng lúc
+        // mở hộp, để phím gõ tiếp không rơi vào island đã thu gọn. Windows gửi ngay WM_ACTIVATE
+        // về island, nhưng wnd_proc chỉ hẹn xử lý sau nên không đụng app đang mượn
+        if let Some(back) = self.lookup_return.take() {
+            unsafe {
+                if GetForegroundWindow() == hwnd
+                    && IsWindow(Some(back)).as_bool()
+                    && IsWindowVisible(back).as_bool()
+                {
+                    let mut ok = SetForegroundWindow(back).as_bool();
+                    if !ok {
+                        // Windows không cho: tạm gắn vào luồng của app kia rồi thử lại
+                        use windows::Win32::System::Threading::{
+                            AttachThreadInput, GetCurrentThreadId,
+                        };
+                        let other = GetWindowThreadProcessId(back, None);
+                        let me = GetCurrentThreadId();
+                        if other != 0 && other != me {
+                            let _ = AttachThreadInput(me, other, true);
+                            ok = SetForegroundWindow(back).as_bool();
+                            let _ = AttachThreadInput(me, other, false);
+                        }
+                    }
+                    crate::trace::log(format!("trả focus về app trước: {ok}"));
+                }
+            }
+        }
+    }
+
+    /// Hộp đang mở: island từng được focus mà giờ cửa sổ khác ở trước nhất thì đóng hộp.
+    /// Không chỉ dựa vào WM_ACTIVATE: có lúc Windows không gửi thông điệp mất focus cho island
+    /// (mở, đóng rồi mở lại hộp), khiến bấm ra ngoài mà hộp vẫn nằm đó
+    fn check_lookup_focus(&mut self, hwnd: HWND) {
+        let front = unsafe { GetForegroundWindow() };
+        if front == hwnd {
+            self.lookup_focused = true;
+        } else if self.lookup_focused {
+            crate::trace::log(format!(
+                "cửa sổ khác lên trước mà không có WM_ACTIVATE: {}",
+                crate::trace::foreground()
+            ));
+            self.close_lookup(hwnd);
+        }
     }
 
     /// Dòng gợi ý dưới ô nhập: clipboard (đọc lại mỗi lần mở) và lịch sử
