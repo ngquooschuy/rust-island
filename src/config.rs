@@ -185,15 +185,40 @@ impl Default for AlertsConfig {
     }
 }
 
-/// Trợ lý AI (Cloudflare Workers AI).
-/// API token không nằm ở đây mà trong Windows Credential Manager (xem secret.rs)
+/// Trợ lý AI gọi qua đâu, trong file TOML viết "cloudflare" hoặc "claude"
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiProvider {
+    /// Workers AI của Cloudflare (model gpt-oss)
+    #[default]
+    Cloudflare,
+    /// Claude của Anthropic, qua API chính chủ hoặc một gateway cùng kiểu API
+    Claude,
+}
+
+impl AiProvider {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::Claude => "claude",
+        }
+    }
+}
+
+/// Trợ lý AI: Cloudflare Workers AI hoặc Claude.
+/// API token/key không nằm ở đây mà trong Windows Credential Manager (xem secret.rs)
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
+    pub provider: AiProvider,
     /// Model của Workers AI, ví dụ "@cf/openai/gpt-oss-20b"
     pub model: String,
     /// Account ID của Cloudflare
     pub account_id: String,
+    /// Địa chỉ gốc của API Claude: "https://api.anthropic.com" hoặc gateway cùng kiểu API
+    pub base_url: String,
+    /// Model Claude, ví dụ "claude-haiku-5-5"
+    pub claude_model: String,
     /// Lời dặn cho trợ lý (vai trò, cách trả lời)
     pub system_prompt: String,
     /// Không tìm được lời bài hát theo tên đang phát thì nhờ AI đoán tên bài thật
@@ -225,8 +250,11 @@ impl AiConfig {
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
+            provider: AiProvider::Cloudflare,
             model: crate::ai::MODELS[0].0.to_string(),
             account_id: String::new(),
+            base_url: crate::ai::CLAUDE_DEFAULT_BASE_URL.to_string(),
+            claude_model: crate::ai::CLAUDE_MODELS[0].0.to_string(),
             system_prompt: crate::ai::DEFAULT_SYSTEM_PROMPT.to_string(),
             guess_song_names: true,
         }
@@ -565,8 +593,11 @@ impl Config {
                 self.alerts.notifications.to_string(),
             ),
             ("alerts", "seconds", self.alerts.seconds.to_string()),
+            ("ai", "provider", quoted(self.ai.provider.name())),
             ("ai", "model", quoted(&self.ai.model)),
             ("ai", "account_id", quoted(&self.ai.account_id)),
+            ("ai", "base_url", quoted(&self.ai.base_url)),
+            ("ai", "claude_model", quoted(&self.ai.claude_model)),
             ("ai", "system_prompt", quoted(&self.ai.system_prompt)),
             (
                 "ai",
@@ -772,6 +803,18 @@ delay_seconds = 0",
         let back = Config::parse(&text).unwrap();
         assert_eq!(back.ai.system_prompt, "Dòng 1\nDòng \"2\"\n\tDòng 3 \\ hết");
         assert_eq!(back.ai.account_id, "abc123");
+    }
+
+    #[test]
+    fn claude_provider_survives_saving() {
+        let mut c = Config::default();
+        assert_eq!(c.ai.provider, AiProvider::Cloudflare);
+        assert_eq!(c.ai.claude_model, "claude-haiku-5-5");
+        c.ai.provider = AiProvider::Claude;
+        c.ai.base_url = "https://gateway.example".into();
+        let back = Config::parse(&with_config(DEFAULT_TOML, &c)).unwrap();
+        assert_eq!(back.ai, c.ai);
+        assert!(Config::parse("[ai]\nprovider = \"openai\"").is_err());
     }
 
     #[test]

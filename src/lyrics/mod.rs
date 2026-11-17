@@ -138,11 +138,15 @@ impl Requester {
 }
 
 /// Bật tính năng: chuẩn bị cache (`cache_mb = 0` là tắt) và chạy luồng nền.
-/// `ai`: (Account ID, model) để nhờ AI đoán tên bài khi không tìm được lời; None = không dùng
-pub fn start(hwnd_raw: isize, cache_mb: u32, ai: Option<(&str, &str)>) -> Requester {
+/// `ai`: nhà cung cấp và model để nhờ AI đoán tên bài khi không tìm được lời; None = không dùng
+pub fn start(
+    hwnd_raw: isize,
+    cache_mb: u32,
+    ai: Option<(crate::ai::Endpoint, String)>,
+) -> Requester {
     let dir = crate::config::path().and_then(|p| Some(p.parent()?.join("lyrics")));
     let _ = CACHE.set(dir.and_then(|d| Cache::new(d, cache_mb)));
-    let guesser = ai.and_then(|(account_id, model)| Guesser::new(account_id, model));
+    let guesser = ai.and_then(|(endpoint, model)| Guesser::new(endpoint, model));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || run(hwnd_raw, rx, guesser));
     Requester { tx }
@@ -327,8 +331,8 @@ mod tests {
         let _ = std::fs::create_dir_all(temp.join("DynamicIsland"));
         // SAFETY: chỉ test này đổi APPDATA, chạy một mình với --ignored
         unsafe { std::env::set_var("APPDATA", &temp) };
-        println!("model: {}", ai.model);
-        let guesser = Guesser::new(&ai.account_id, &ai.model).expect("chưa nhập Account ID");
+        let (endpoint, model) = crate::ai::Endpoint::from_config(&ai);
+        let guesser = Guesser::new(endpoint, model).expect("chưa cấu hình AI");
         let session = Session::open().unwrap();
         let cases = [
             (

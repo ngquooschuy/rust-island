@@ -66,11 +66,16 @@ notifications = true # thông báo Windows mới (lần đầu Windows có thể
 seconds = 4          # mỗi thông báo hiện bao lâu (2–30 giây); rê chuột vào thì giữ lại
 
 [ai]
-# Trợ lý AI dùng Workers AI của Cloudflare.
-# API token KHÔNG nằm trong file này: nhập trong cửa sổ Cài đặt, app cất vào
-# Windows Credential Manager (mục "DynamicIsland/CloudflareAIToken").
+# Trợ lý AI: "cloudflare" (Workers AI) hoặc "claude" (API của Anthropic, hoặc gateway cùng kiểu API).
+# Token/key KHÔNG nằm trong file này: nhập trong cửa sổ Cài đặt, app cất vào Windows
+# Credential Manager (mục "DynamicIsland/CloudflareAIToken" và "DynamicIsland/ClaudeAPIKey").
+provider = "cloudflare"
+# Cloudflare
 model = "@cf/openai/gpt-oss-20b"   # hoặc "@cf/openai/gpt-oss-120b" (thông minh hơn, chậm hơn)
 account_id = ""                    # Account ID trong trang Cloudflare (dashboard > Workers AI)
+# Claude: địa chỉ gốc của API (đổi thành địa chỉ gateway nếu dùng gateway) và model
+base_url = "https://api.anthropic.com"
+claude_model = "claude-haiku-5-5"  # hoặc "claude-sonnet-5-5", "claude-opus-5-5"
 # Không tìm được lời bài hát (tên video YouTube lộn xộn, kênh vietsub...) thì gửi tên đang
 # phát cho AI đoán tên bài và ca sĩ thật rồi tìm lại. Mỗi bài chỉ hỏi một lần
 guess_song_names = true

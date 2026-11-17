@@ -134,19 +134,16 @@ pub fn forget_all() {
     }
 }
 
-/// Cấu hình AI để hỏi tên bài (token đọc từ Credential Manager mỗi lần hỏi)
+/// Nhà cung cấp và model để hỏi tên bài (token/key đọc từ Credential Manager mỗi lần hỏi)
 pub struct Guesser {
-    account_id: String,
+    endpoint: ai::Endpoint,
     model: String,
 }
 
 impl Guesser {
-    /// None nếu chưa nhập Account ID
-    pub fn new(account_id: &str, model: &str) -> Option<Self> {
-        (!account_id.trim().is_empty()).then(|| Self {
-            account_id: account_id.trim().to_string(),
-            model: model.to_string(),
-        })
+    /// None nếu chưa nhập Account ID (Cloudflare) / Base URL (Claude)
+    pub fn new(endpoint: ai::Endpoint, model: String) -> Option<Self> {
+        endpoint.is_set_up().then_some(Self { endpoint, model })
     }
 
     /// Tên bài và ca sĩ thật của `t`. Ok(None): AI không biết (đã nhớ, lần sau không hỏi
@@ -155,9 +152,10 @@ impl Guesser {
         if let Some(known) = with_memo(|m| m.get(t).cloned()) {
             return Ok(known);
         }
-        let token = crate::secret::load_token().ok_or("chưa lưu API token")?;
+        let token =
+            crate::secret::load_token(self.endpoint.provider()).ok_or("chưa lưu API token/key")?;
         let settings = ai::Settings {
-            account_id: self.account_id.clone(),
+            endpoint: self.endpoint.clone(),
             token,
             model: self.model.clone(),
             system_prompt: SYSTEM_PROMPT.to_string(),

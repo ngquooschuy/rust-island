@@ -1,6 +1,7 @@
-//! Cất API token của Cloudflare trong Windows Credential Manager (Trình quản lý thông tin
-//! xác thực), không ghi vào config.toml: Windows mã hóa theo tài khoản người dùng, và token
+//! Cất API token/key của trợ lý AI trong Windows Credential Manager (Trình quản lý thông tin
+//! xác thực), không ghi vào config.toml: Windows mã hóa theo tài khoản người dùng, và key
 //! không lộ ra nếu ai đó mở hay chia sẻ file cấu hình.
+//! Mỗi nhà cung cấp một mục riêng, đổi qua lại không mất key của bên kia.
 //! Xem/xóa bằng tay: Control Panel > Credential Manager > Windows Credentials > "DynamicIsland/…".
 
 use windows::{
@@ -11,14 +12,22 @@ use windows::{
     core::{HSTRING, PWSTR},
 };
 
-/// Tên mục trong Credential Manager
-const TARGET: &str = "DynamicIsland/CloudflareAIToken";
+use crate::config::AiProvider;
 
-/// Token đã lưu (None nếu chưa có)
-pub fn load_token() -> Option<String> {
+/// (tên mục trong Credential Manager, tên người dùng hiện ở đó)
+fn target(provider: AiProvider) -> (&'static str, &'static str) {
+    match provider {
+        AiProvider::Cloudflare => ("DynamicIsland/CloudflareAIToken", "Cloudflare API token"),
+        AiProvider::Claude => ("DynamicIsland/ClaudeAPIKey", "Claude API key"),
+    }
+}
+
+/// Token/key đã lưu của nhà cung cấp (None nếu chưa có)
+pub fn load_token(provider: AiProvider) -> Option<String> {
+    let (name, _) = target(provider);
     unsafe {
         let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
-        CredReadW(&HSTRING::from(TARGET), CRED_TYPE_GENERIC, None, &mut cred).ok()?;
+        CredReadW(&HSTRING::from(name), CRED_TYPE_GENERIC, None, &mut cred).ok()?;
         let c = &*cred;
         let bytes = std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize);
         // Lưu dạng UTF-16 như các app Windows khác
@@ -34,15 +43,16 @@ pub fn load_token() -> Option<String> {
     }
 }
 
-/// Lưu (hoặc thay) token
-pub fn save_token(token: &str) -> windows::core::Result<()> {
+/// Lưu (hoặc thay) token/key của nhà cung cấp
+pub fn save_token(provider: AiProvider, token: &str) -> windows::core::Result<()> {
+    let (name, user) = target(provider);
     let mut blob: Vec<u8> = token
         .trim()
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
         .collect();
-    let mut target: Vec<u16> = TARGET.encode_utf16().chain([0]).collect();
-    let mut user: Vec<u16> = "Cloudflare API token".encode_utf16().chain([0]).collect();
+    let mut target: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    let mut user: Vec<u16> = user.encode_utf16().chain([0]).collect();
     let cred = CREDENTIALW {
         Flags: CRED_FLAGS(0),
         Type: CRED_TYPE_GENERIC,
@@ -56,14 +66,15 @@ pub fn save_token(token: &str) -> windows::core::Result<()> {
     unsafe { CredWriteW(&cred, 0) }
 }
 
-/// Xóa token (không có thì thôi)
-pub fn delete_token() {
+/// Xóa token/key của nhà cung cấp (không có thì thôi)
+pub fn delete_token(provider: AiProvider) {
+    let (name, _) = target(provider);
     unsafe {
-        let _ = CredDeleteW(&HSTRING::from(TARGET), CRED_TYPE_GENERIC, None);
+        let _ = CredDeleteW(&HSTRING::from(name), CRED_TYPE_GENERIC, None);
     }
 }
 
-/// Đã có token chưa
-pub fn has_token() -> bool {
-    load_token().is_some()
+/// Nhà cung cấp này đã có token/key chưa
+pub fn has_token(provider: AiProvider) -> bool {
+    load_token(provider).is_some()
 }

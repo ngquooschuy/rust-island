@@ -1,8 +1,11 @@
-//! Trợ lý AI: gọi Workers AI của Cloudflare (model gpt-oss của OpenAI).
+//! Trợ lý AI, gọi qua một trong hai nhà cung cấp (chọn trong Cài đặt):
+//! - Workers AI của Cloudflare (model gpt-oss của OpenAI): các lượt chat được gửi tới
+//!   `https://api.cloudflare.com/client/v4/accounts/<ID>/ai/run/<model>`.
+//! - Claude của Anthropic: `POST <base_url>/v1/messages`, với `base_url` là API chính chủ
+//!   (`https://api.anthropic.com`) hoặc một gateway cùng kiểu API.
 //!
-//! Người dùng tự cấu hình Account ID (trong config.toml) và API token (cất trong Windows
-//! Credential Manager, xem secret.rs). Các lượt chat được gửi tới
-//! `https://api.cloudflare.com/client/v4/accounts/<ID>/ai/run/<model>`.
+//! Account ID, Base URL, model nằm trong config.toml; token/key cất trong Windows Credential
+//! Manager (xem secret.rs).
 //!
 //! Tài liệu của Cloudflare không mô tả dạng kết quả của gpt-oss, nên `parse_reply` nhận cả
 //! ba dạng hay gặp: `result.response`, `result.choices[0].message.content` (kiểu Chat
@@ -11,6 +14,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::config::{AiConfig, AiProvider};
 use crate::http::Session;
 
 /// Các model chọn được: (mã model, tên hiện trong Cài đặt)
@@ -18,6 +22,23 @@ pub const MODELS: [(&str, &str); 2] = [
     ("@cf/openai/gpt-oss-20b", "GPT-OSS 20B (nhanh, rẻ)"),
     ("@cf/openai/gpt-oss-120b", "GPT-OSS 120B (thông minh hơn)"),
 ];
+
+/// Model Claude chọn được: (mã model, tên hiện trong Cài đặt). Cái đầu tiên là mặc định
+pub const CLAUDE_MODELS: [(&str, &str); 3] = [
+    ("claude-haiku-5-5", "Claude Haiku 5.5 (nhanh, rẻ)"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+    ("claude-opus-5-5", "Claude Opus 5.5 (thông minh nhất)"),
+];
+
+/// API chính chủ của Anthropic; dùng gateway thì đổi thành địa chỉ của gateway
+pub const CLAUDE_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+/// Phiên bản API gửi trong header `anthropic-version`. Dùng bản 2023-06-01 vì gateway bên
+/// thứ ba nào cũng nhận; API chính chủ vẫn nhận bản này
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Câu trả lời của Claude gồm cả phần suy nghĩ (luôn bật trên Haiku 5.5), nên chừa rộng
+const CLAUDE_MAX_TOKENS: u32 = 4096;
+/// Các việc hiện có (đoán tên bài, kiểm tra kết nối) đều ngắn: nghĩ ít cho nhanh và rẻ
+const CLAUDE_EFFORT: &str = "low";
 
 /// Lời dặn mặc định cho trợ lý (người dùng sửa được trong Cài đặt)
 pub const DEFAULT_SYSTEM_PROMPT: &str = "Bạn là trợ lý thân thiện trên Dynamic Island của Windows. \
@@ -59,10 +80,52 @@ struct Request {
     max_tokens: u32,
 }
 
+/// Gọi AI qua đâu
+#[derive(Clone, Debug, PartialEq)]
+pub enum Endpoint {
+    Cloudflare { account_id: String },
+    Claude { base_url: String },
+}
+
+impl Endpoint {
+    /// Nhà cung cấp đang chọn trong cấu hình, kèm model của nhà cung cấp đó
+    pub fn from_config(c: &AiConfig) -> (Self, String) {
+        match c.provider {
+            AiProvider::Cloudflare => (
+                Self::Cloudflare {
+                    account_id: c.account_id.trim().to_string(),
+                },
+                c.model.clone(),
+            ),
+            AiProvider::Claude => (
+                Self::Claude {
+                    base_url: c.base_url.trim().to_string(),
+                },
+                c.claude_model.clone(),
+            ),
+        }
+    }
+
+    pub fn provider(&self) -> AiProvider {
+        match self {
+            Self::Cloudflare { .. } => AiProvider::Cloudflare,
+            Self::Claude { .. } => AiProvider::Claude,
+        }
+    }
+
+    /// Đã nhập Account ID (Cloudflare) / Base URL (Claude) chưa
+    pub fn is_set_up(&self) -> bool {
+        match self {
+            Self::Cloudflare { account_id } => !account_id.trim().is_empty(),
+            Self::Claude { base_url } => !base_url.trim().is_empty(),
+        }
+    }
+}
+
 /// Thông tin cần để gọi AI
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
-    pub account_id: String,
+    pub endpoint: Endpoint,
     pub token: String,
     pub model: String,
     pub system_prompt: String,
@@ -173,6 +236,83 @@ pub fn parse_reply(body: &str) -> Result<String, String> {
     }
 }
 
+/// Địa chỉ gọi Claude: `<base_url>/v1/messages` (Base URL có sẵn đuôi /v1 cũng được)
+pub fn claude_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
+/// Thân request kiểu Messages API của Anthropic: lời dặn nằm ở trường `system` riêng
+pub fn claude_body(model: &str, system_prompt: &str, chat: &[Message]) -> String {
+    let mut body = serde_json::json!({
+        "model": model.trim(),
+        "max_tokens": CLAUDE_MAX_TOKENS,
+        "messages": chat,
+        "output_config": { "effort": CLAUDE_EFFORT },
+    });
+    if !system_prompt.trim().is_empty() {
+        body["system"] = Value::from(system_prompt.trim());
+    }
+    body.to_string()
+}
+
+/// Lời nhắn lỗi Anthropic gửi kèm: {"type":"error","error":{"type":..,"message":".."}}
+fn claude_error_message(v: &Value) -> Option<String> {
+    v.get("error")?.get("message")?.as_str().map(str::to_string)
+}
+
+/// Câu trả lời của Claude (HTTP 200): nối các khối chữ trong `content[]`, bỏ khối suy nghĩ
+pub fn parse_claude_reply(body: &str) -> Result<String, String> {
+    let v: Value = serde_json::from_str(body).map_err(|_| "AI trả về dữ liệu lạ".to_string())?;
+    if v.get("type").and_then(Value::as_str) == Some("error") {
+        return Err(claude_error_message(&v).unwrap_or_else(|| "AI báo lỗi".to_string()));
+    }
+    if v.get("stop_reason").and_then(Value::as_str) == Some("refusal") {
+        return Err("Claude từ chối trả lời câu này".to_string());
+    }
+    let text: Vec<&str> = v
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = text.join("");
+    if text.trim().is_empty() {
+        Err("AI không trả lời (thử hỏi lại)".to_string())
+    } else {
+        Ok(text)
+    }
+}
+
+/// Lời nhắn cho mã lỗi HTTP thường gặp khi gọi Claude (API chính chủ hoặc gateway)
+fn claude_http_error(status: u32, body: &str) -> String {
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| claude_error_message(&v));
+    let hint = match status {
+        400 => "Yêu cầu không hợp lệ",
+        401 | 403 => "API key sai hoặc không có quyền",
+        404 => "Sai Base URL hoặc tên model",
+        429 => "Gọi AI quá nhiều, đợi một lát rồi thử lại",
+        529 => "Claude đang quá tải, thử lại sau",
+        500..=599 => "Máy chủ AI đang lỗi, thử lại sau",
+        _ => "AI báo lỗi",
+    };
+    match detail {
+        Some(d) => format!("{hint} (HTTP {status}: {d})"),
+        None => format!("{hint} (HTTP {status})"),
+    }
+}
+
 /// Lời nhắn cho mã lỗi HTTP thường gặp
 fn http_error(status: u32, body: &str) -> String {
     let detail = serde_json::from_str::<Value>(body)
@@ -215,19 +355,51 @@ pub fn ask_raw(settings: &Settings, chat: &[Message]) -> Result<String, String> 
              - Vị umami của cà chua và phô mai làm ta muốn ăn thêm"
         ));
     }
-    if settings.account_id.trim().is_empty() || settings.token.trim().is_empty() {
-        return Err("Chưa cấu hình AI: mở Cài đặt > Trợ lý AI để nhập Account ID và token".into());
+    let token = settings.token.trim();
+    if !settings.endpoint.is_set_up() || token.is_empty() {
+        let need = match settings.endpoint {
+            Endpoint::Cloudflare { .. } => "Account ID và token",
+            Endpoint::Claude { .. } => "Base URL và API key",
+        };
+        return Err(format!(
+            "Chưa cấu hình AI: mở Cài đặt > Trợ lý AI để nhập {need}"
+        ));
     }
     let session = Session::open().map_err(|e| format!("Không kết nối được: {e}"))?;
-    let body = request_body(&settings.system_prompt, chat);
-    let auth = format!("Bearer {}", settings.token.trim());
-    let response = session
-        .post_json(&url(&settings.account_id, &settings.model), &auth, &body)
-        .map_err(|e| format!("Không kết nối được tới Cloudflare: {e}"))?;
-    if response.status != 200 {
-        return Err(http_error(response.status, &response.body));
+    match &settings.endpoint {
+        Endpoint::Cloudflare { account_id } => {
+            let body = request_body(&settings.system_prompt, chat);
+            let auth = format!("Bearer {token}");
+            let response = session
+                .post_json(
+                    &url(account_id, &settings.model),
+                    &[("Authorization", &auth)],
+                    &body,
+                )
+                .map_err(|e| format!("Không kết nối được tới Cloudflare: {e}"))?;
+            if response.status != 200 {
+                return Err(http_error(response.status, &response.body));
+            }
+            parse_reply(&response.body)
+        }
+        Endpoint::Claude { base_url } => {
+            let body = claude_body(&settings.model, &settings.system_prompt, chat);
+            let response = session
+                .post_json(
+                    &claude_url(base_url),
+                    &[
+                        ("x-api-key", token),
+                        ("anthropic-version", ANTHROPIC_VERSION),
+                    ],
+                    &body,
+                )
+                .map_err(|e| format!("Không kết nối được tới {base_url}: {e}"))?;
+            if response.status != 200 {
+                return Err(claude_http_error(response.status, &response.body));
+            }
+            parse_claude_reply(&response.body)
+        }
     }
-    parse_reply(&response.body)
 }
 
 /// Bỏ ký hiệu Markdown để hiện chữ thường (trong Cài đặt, trên island):
@@ -344,7 +516,9 @@ mod tests {
     #[test]
     fn missing_settings_fail_before_any_network_call() {
         let s = Settings {
-            account_id: String::new(),
+            endpoint: Endpoint::Cloudflare {
+                account_id: String::new(),
+            },
             token: "t".into(),
             model: MODELS[0].0.into(),
             system_prompt: String::new(),
@@ -353,6 +527,70 @@ mod tests {
             ask(&s, &[Message::user("hi")])
                 .unwrap_err()
                 .contains("Chưa cấu hình AI")
+        );
+        // Claude: thiếu key thì báo cần API key, không gọi mạng
+        let s = Settings {
+            endpoint: Endpoint::Claude {
+                base_url: CLAUDE_DEFAULT_BASE_URL.into(),
+            },
+            token: " ".into(),
+            model: CLAUDE_MODELS[0].0.into(),
+            system_prompt: String::new(),
+        };
+        assert!(
+            ask(&s, &[Message::user("hi")])
+                .unwrap_err()
+                .contains("API key")
+        );
+    }
+
+    #[test]
+    fn claude_url_accepts_base_with_or_without_v1() {
+        let want = "https://gw.example/v1/messages";
+        assert_eq!(claude_url("https://gw.example"), want);
+        assert_eq!(claude_url(" https://gw.example/ "), want);
+        assert_eq!(claude_url("https://gw.example/v1/"), want);
+    }
+
+    #[test]
+    fn claude_body_puts_system_prompt_apart_and_thinks_little() {
+        let body: Value = serde_json::from_str(&claude_body(
+            "claude-haiku-5-5",
+            "Trả lời ngắn",
+            &[Message::user("Xin chào")],
+        ))
+        .unwrap();
+        assert_eq!(body["model"], "claude-haiku-5-5");
+        assert_eq!(body["system"], "Trả lời ngắn");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "Xin chào");
+        assert_eq!(body["output_config"]["effort"], "low");
+        let no_system: Value =
+            serde_json::from_str(&claude_body("m", "  ", &[Message::user("x")])).unwrap();
+        assert!(no_system.get("system").is_none());
+    }
+
+    #[test]
+    fn reads_claude_replies_and_errors() {
+        let ok = r#"{"id":"msg_1","type":"message","role":"assistant","content":[
+            {"type":"thinking","thinking":""},
+            {"type":"text","text":"Xin "},{"type":"text","text":"chào"}],
+            "stop_reason":"end_turn"}"#;
+        assert_eq!(parse_claude_reply(ok).unwrap(), "Xin chào");
+        let refused = r#"{"type":"message","content":[],"stop_reason":"refusal"}"#;
+        assert!(parse_claude_reply(refused).unwrap_err().contains("từ chối"));
+        let error = r#"{"type":"error","error":{"type":"not_found_error","message":"model: x"}}"#;
+        assert_eq!(parse_claude_reply(error).unwrap_err(), "model: x");
+        assert_eq!(
+            claude_http_error(
+                401,
+                r#"{"type":"error","error":{"message":"invalid x-api-key"}}"#
+            ),
+            "API key sai hoặc không có quyền (HTTP 401: invalid x-api-key)"
+        );
+        assert_eq!(
+            claude_http_error(404, "<html>"),
+            "Sai Base URL hoặc tên model (HTTP 404)"
         );
     }
 

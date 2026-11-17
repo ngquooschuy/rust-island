@@ -23,7 +23,7 @@ use windows::{
     core::{HSTRING, PCWSTR, w},
 };
 
-use crate::config::{self, BackdropKind, Color, Config};
+use crate::config::{self, AiProvider, BackdropKind, Color, Config};
 use crate::{ai, autostart, lyrics, secret};
 
 // Mã số control. Lưu = IDOK và Hủy = IDCANCEL để phím Enter / Esc tự bấm hai nút đó
@@ -62,6 +62,14 @@ const ID_OFFSET_SONG: i32 = 80;
 const ID_OFFSET: i32 = 81;
 const ID_OFFSET_VALUE: i32 = 82;
 const ID_OFFSET_RESET: i32 = 83;
+const ID_AI_PROVIDER: i32 = 84;
+/// Nhãn đổi theo nhà cung cấp: "Account ID" (Cloudflare) / "Base URL" (Claude)
+const ID_AI_ROW_LABEL: i32 = 85;
+const ID_AI_BASE_URL: i32 = 86;
+const ID_AI_CLAUDE_MODEL: i32 = 87;
+/// Nhãn "API token" (Cloudflare) / "API key" (Claude)
+const ID_AI_TOKEN_LABEL: i32 = 88;
+const ID_AI_NOTE: i32 = 89;
 const ID_AI_GUESS: i32 = 90;
 const ID_AI_MODEL: i32 = 93;
 const ID_AI_ACCOUNT: i32 = 94;
@@ -192,6 +200,12 @@ fn set_text(hwnd: HWND, id: i32, s: &str) {
 fn enable(hwnd: HWND, id: i32, on: bool) {
     unsafe {
         let _ = EnableWindow(item(hwnd, id), on);
+    }
+}
+
+fn show(hwnd: HWND, id: i32, on: bool) {
+    unsafe {
+        let _ = ShowWindow(item(hwnd, id), if on { SW_SHOW } else { SW_HIDE });
     }
 }
 
@@ -423,6 +437,19 @@ impl Builder {
     fn combo(&self, x: i32, y: i32, w: i32, id: i32) {
         let style = CBS_DROPDOWNLIST | (WS_VSCROLL.0 | WS_TABSTOP.0) as i32;
         // Chiều cao ở đây là chiều cao danh sách khi thả xuống
+        self.add(
+            w!("COMBOBOX"),
+            "",
+            style,
+            WINDOW_EX_STYLE(0),
+            (x, y, w, 320),
+            id,
+        );
+    }
+
+    /// Danh sách chọn mà vẫn gõ tay được giá trị khác
+    fn combo_editable(&self, x: i32, y: i32, w: i32, id: i32) {
+        let style = CBS_DROPDOWN | CBS_AUTOHSCROLL | (WS_VSCROLL.0 | WS_TABSTOP.0) as i32;
         self.add(
             w!("COMBOBOX"),
             "",
@@ -728,40 +755,37 @@ fn build(b: &Builder) {
     b.label("giây", 552, 562, 60, -1);
 
     // ===== Cột thứ ba: Trợ lý AI =====
-    b.group("Trợ lý AI (Cloudflare Workers AI)", 644, 8, 300, 590);
-    b.label("Model", 656, 34, 80, -1);
-    b.combo(740, 32, 192, ID_AI_MODEL);
-    b.label("Account ID", 656, 66, 80, -1);
+    b.group("Trợ lý AI", 644, 8, 300, 590);
+    b.label("Dùng", 656, 34, 80, -1);
+    b.combo(740, 32, 192, ID_AI_PROVIDER);
+    // Hai bộ ô của hai nhà cung cấp nằm chồng lên nhau, chỉ hiện bộ đang chọn
+    b.label("Account ID", 656, 66, 80, ID_AI_ROW_LABEL);
     b.edit(740, 64, 192, ID_AI_ACCOUNT, false);
-    b.label("API token", 656, 98, 80, -1);
-    b.password(740, 96, 192, ID_AI_TOKEN);
-    b.button("Xóa token đã lưu", 740, 126, 192, ID_AI_TOKEN_CLEAR, false);
+    b.edit(740, 64, 192, ID_AI_BASE_URL, false);
+    b.label("Model", 656, 98, 80, -1);
+    b.combo(740, 96, 192, ID_AI_MODEL);
+    b.combo_editable(740, 96, 192, ID_AI_CLAUDE_MODEL);
+    b.label("API token", 656, 130, 80, ID_AI_TOKEN_LABEL);
+    b.password(740, 128, 192, ID_AI_TOKEN);
+    b.button("Xóa token đã lưu", 740, 158, 192, ID_AI_TOKEN_CLEAR, false);
     b.check(
         "Nhờ AI đoán tên bài khi không tìm được lời",
         656,
-        160,
+        192,
         280,
         ID_AI_GUESS,
     );
     b.label(
         "Lời dặn cho trợ lý (vai trò, cách trả lời)",
         656,
-        192,
+        222,
         276,
         -1,
     );
-    b.multiline(656, 216, 276, 156, ID_AI_PROMPT);
+    b.multiline(656, 246, 276, 126, ID_AI_PROMPT);
     b.button("Kiểm tra kết nối", 656, 382, 140, ID_AI_TEST, false);
     b.note("", 656, 416, 276, 104, ID_AI_TEST_RESULT);
-    b.note(
-        "Câu hỏi được gửi tới Workers AI của Cloudflare. Token cất trong Windows \
-         Credential Manager, không ghi vào file cấu hình.",
-        656,
-        530,
-        276,
-        54,
-        -1,
-    );
+    b.note("", 656, 526, 276, 64, ID_AI_NOTE);
 
     // ===== Hàng nút =====
     b.button("Mặc định", 12, 610, 100, ID_DEFAULTS, false);
@@ -784,8 +808,14 @@ fn build(b: &Builder) {
         combo_add(hwnd, ID_CACHE, &label, mb as usize);
     }
     send(hwnd, ID_FONT, CB_SETMINVISIBLE, 14, 0);
+    combo_add(hwnd, ID_AI_PROVIDER, "Cloudflare Workers AI", 0);
+    combo_add(hwnd, ID_AI_PROVIDER, "Claude (Anthropic)", 1);
     for (i, (_, label)) in ai::MODELS.iter().enumerate() {
         combo_add(hwnd, ID_AI_MODEL, label, i);
+    }
+    // Model Claude hiện đúng mã model, để gõ tay tên khác (gateway) cũng cùng một kiểu
+    for (i, (id, _)) in ai::CLAUDE_MODELS.iter().enumerate() {
+        combo_add(hwnd, ID_AI_CLAUDE_MODEL, id, i);
     }
     let banner = HSTRING::from("Dán token mới vào đây");
     send(
@@ -872,6 +902,14 @@ fn fill(hwnd: HWND, config: &Config) {
         .unwrap_or_else(|| combo_add(hwnd, ID_AI_MODEL, &assistant.model, usize::MAX));
     combo_select(hwnd, ID_AI_MODEL, model);
     set_text(hwnd, ID_AI_ACCOUNT, &assistant.account_id);
+    let provider = match assistant.provider {
+        AiProvider::Cloudflare => 0,
+        AiProvider::Claude => 1,
+    };
+    combo_select(hwnd, ID_AI_PROVIDER, provider);
+    set_text(hwnd, ID_AI_BASE_URL, &assistant.base_url);
+    set_text(hwnd, ID_AI_CLAUDE_MODEL, &assistant.claude_model);
+    set_text(hwnd, ID_AI_TEST_RESULT, "");
     set_checked(hwnd, ID_AI_GUESS, assistant.guess_song_names);
     set_text(hwnd, ID_AI_TOKEN, "");
     // Ô nhập nhiều dòng của Windows cần \r\n để xuống dòng
@@ -884,7 +922,25 @@ fn fill(hwnd: HWND, config: &Config) {
     update_enabled(hwnd);
 }
 
-/// Model đang chọn
+/// Nhà cung cấp đang chọn
+fn chosen_provider(hwnd: HWND) -> AiProvider {
+    match combo_data(hwnd, ID_AI_PROVIDER) {
+        Some(1) => AiProvider::Claude,
+        _ => AiProvider::Cloudflare,
+    }
+}
+
+/// Model Claude: chọn trong danh sách hoặc gõ tay; để trống thì dùng model mặc định
+fn chosen_claude_model(hwnd: HWND) -> String {
+    let typed = text(hwnd, ID_AI_CLAUDE_MODEL).trim().to_string();
+    if typed.is_empty() {
+        ai::CLAUDE_MODELS[0].0.to_string()
+    } else {
+        typed
+    }
+}
+
+/// Model Cloudflare đang chọn
 fn chosen_model(hwnd: HWND) -> String {
     match combo_data(hwnd, ID_AI_MODEL).and_then(|i| ai::MODELS.get(i)) {
         Some((id, _)) => id.to_string(),
@@ -917,6 +973,11 @@ fn read(hwnd: HWND) -> Result<Config, &'static str> {
     let weather = checked(hwnd, ID_WEATHER);
     if weather && city.is_empty() {
         return Err("Hãy nhập tên thành phố để xem thời tiết.");
+    }
+    let base_url = text(hwnd, ID_AI_BASE_URL);
+    let base_url = base_url.trim();
+    if !base_url.is_empty() && !base_url.starts_with("https://") {
+        return Err("Base URL của Claude phải bắt đầu bằng https://");
     }
 
     let [background, text_color, secondary, accent] = state.colors;
@@ -951,8 +1012,11 @@ fn read(hwnd: HWND) -> Result<Config, &'static str> {
     c.alerts.clipboard = checked(hwnd, ID_ALERT_CLIPBOARD);
     c.alerts.notifications = checked(hwnd, ID_ALERT_NOTIFICATIONS);
     c.alerts.seconds = alert_seconds;
+    c.ai.provider = chosen_provider(hwnd);
     c.ai.model = chosen_model(hwnd);
     c.ai.account_id = text(hwnd, ID_AI_ACCOUNT).trim().to_string();
+    c.ai.base_url = text(hwnd, ID_AI_BASE_URL).trim().to_string();
+    c.ai.claude_model = chosen_claude_model(hwnd);
     c.ai.guess_song_names = checked(hwnd, ID_AI_GUESS);
     let prompt = text(hwnd, ID_AI_PROMPT).replace("\r\n", "\n");
     c.ai.system_prompt = prompt.trim().to_string();
@@ -1092,12 +1156,40 @@ fn update_enabled(hwnd: HWND) {
     set_text(hwnd, ID_CLEAR_CACHE, &label);
     enable(hwnd, ID_CLEAR_CACHE, lyrics && has_files);
 
-    let has_token = secret::has_token();
-    enable(hwnd, ID_AI_TOKEN_CLEAR, has_token);
-    let banner = HSTRING::from(if has_token {
-        "Đã lưu (để trống để giữ nguyên)"
+    let provider = chosen_provider(hwnd);
+    let claude = provider == AiProvider::Claude;
+    show(hwnd, ID_AI_ACCOUNT, !claude);
+    show(hwnd, ID_AI_MODEL, !claude);
+    show(hwnd, ID_AI_BASE_URL, claude);
+    show(hwnd, ID_AI_CLAUDE_MODEL, claude);
+    let (row, key, clear, note) = if claude {
+        (
+            "Base URL",
+            "API key",
+            "Xóa key đã lưu",
+            "Câu hỏi được gửi tới Base URL ở trên: API của Anthropic hoặc gateway bạn chọn \
+             (gateway bên thứ ba đọc được mọi thứ gửi qua). Key cất trong Windows Credential \
+             Manager.",
+        )
     } else {
-        "Dán token vào đây"
+        (
+            "Account ID",
+            "API token",
+            "Xóa token đã lưu",
+            "Câu hỏi được gửi tới Workers AI của Cloudflare. Token cất trong Windows \
+             Credential Manager, không ghi vào file cấu hình.",
+        )
+    };
+    set_text(hwnd, ID_AI_ROW_LABEL, row);
+    set_text(hwnd, ID_AI_TOKEN_LABEL, key);
+    set_text(hwnd, ID_AI_TOKEN_CLEAR, clear);
+    set_text(hwnd, ID_AI_NOTE, note);
+    let has_token = secret::has_token(provider);
+    enable(hwnd, ID_AI_TOKEN_CLEAR, has_token);
+    let banner = HSTRING::from(match (has_token, claude) {
+        (true, _) => "Đã lưu (để trống để giữ nguyên)",
+        (false, true) => "Dán API key vào đây",
+        (false, false) => "Dán token vào đây",
     });
     send(
         hwnd,
@@ -1108,17 +1200,32 @@ fn update_enabled(hwnd: HWND) {
     );
 }
 
-/// Gửi một câu hỏi thử bằng Account ID, token (ô nhập hoặc token đã lưu) và model đang chọn
+/// Gửi một câu hỏi thử bằng nhà cung cấp, model, token/key (ô nhập hoặc đã lưu) đang chọn
 fn test_connection(hwnd: HWND) {
+    let provider = chosen_provider(hwnd);
+    let (endpoint, model) = match provider {
+        AiProvider::Cloudflare => (
+            ai::Endpoint::Cloudflare {
+                account_id: text(hwnd, ID_AI_ACCOUNT).trim().to_string(),
+            },
+            chosen_model(hwnd),
+        ),
+        AiProvider::Claude => (
+            ai::Endpoint::Claude {
+                base_url: text(hwnd, ID_AI_BASE_URL).trim().to_string(),
+            },
+            chosen_claude_model(hwnd),
+        ),
+    };
     let typed = text(hwnd, ID_AI_TOKEN).trim().to_string();
     let settings = ai::Settings {
-        account_id: text(hwnd, ID_AI_ACCOUNT).trim().to_string(),
+        endpoint,
         token: if typed.is_empty() {
-            secret::load_token().unwrap_or_default()
+            secret::load_token(provider).unwrap_or_default()
         } else {
             typed
         },
-        model: chosen_model(hwnd),
+        model,
         system_prompt: "Trả lời đúng một câu ngắn.".to_string(),
     };
     set_text(hwnd, ID_AI_TEST_RESULT, "Đang hỏi thử AI…");
@@ -1164,12 +1271,13 @@ fn save(hwnd: HWND) {
     if autostart != autostart::is_enabled() {
         autostart::set(autostart);
     }
-    // Token không nằm trong file cấu hình: cất vào Credential Manager (để trống = giữ cũ)
+    // Token/key không nằm trong file cấu hình: cất vào Credential Manager, vào mục của nhà
+    // cung cấp đang chọn (để trống = giữ cũ)
     let token = text(hwnd, ID_AI_TOKEN).trim().to_string();
     if !token.is_empty()
-        && let Err(e) = secret::save_token(&token)
+        && let Err(e) = secret::save_token(config.ai.provider, &token)
     {
-        return message(hwnd, &format!("Không lưu được API token:\n{e}"));
+        return message(hwnd, &format!("Không lưu được API token/key:\n{e}"));
     }
     let changed = config::load().ok().as_ref() != Some(&config);
     if changed && let Err(e) = config::save(&config) {
@@ -1199,8 +1307,14 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
             update_enabled(hwnd);
         }
         ID_AI_TOKEN_CLEAR => {
-            secret::delete_token();
+            secret::delete_token(chosen_provider(hwnd));
             set_text(hwnd, ID_AI_TOKEN, "");
+            update_enabled(hwnd);
+        }
+        // Đổi nhà cung cấp: bỏ chữ đang gõ trong ô token (là của bên kia), đổi bộ ô hiện ra
+        ID_AI_PROVIDER if code == CBN_SELCHANGE => {
+            set_text(hwnd, ID_AI_TOKEN, "");
+            set_text(hwnd, ID_AI_TEST_RESULT, "");
             update_enabled(hwnd);
         }
         ID_AI_TEST => test_connection(hwnd),

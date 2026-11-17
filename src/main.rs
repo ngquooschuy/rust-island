@@ -312,10 +312,10 @@ fn main() -> Result<()> {
     }
 
     // Lời bài hát: luồng riêng, luồng media báo cho nó mỗi khi đổi bài
-    let ai = &config.ai;
-    let guess = ai
+    let guess = config
+        .ai
         .guess_song_names
-        .then_some((ai.account_id.as_str(), ai.model.as_str()));
+        .then(|| ai::Endpoint::from_config(&config.ai));
     let lyrics = config
         .lyrics
         .enabled

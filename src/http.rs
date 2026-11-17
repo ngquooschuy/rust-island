@@ -80,16 +80,18 @@ impl Session {
         self.send(w!("GET"), url, "", &[], None)
     }
 
-    /// POST nội dung JSON kèm header Authorization. AI cần thời gian "suy nghĩ" nên chờ
-    /// câu trả lời lâu hơn GET thường
+    /// POST nội dung JSON kèm các header riêng (xác thực...). AI cần thời gian "suy nghĩ"
+    /// nên chờ câu trả lời lâu hơn GET thường
     pub fn post_json(
         &self,
         url: &str,
-        authorization: &str,
+        extra_headers: &[(&str, &str)],
         json: &str,
     ) -> Result<Response, String> {
-        let headers =
-            format!("Content-Type: application/json\r\nAuthorization: {authorization}\r\n");
+        let mut headers = String::from("Content-Type: application/json\r\n");
+        for (name, value) in extra_headers {
+            headers.push_str(&format!("{name}: {value}\r\n"));
+        }
         self.send(
             w!("POST"),
             url,
